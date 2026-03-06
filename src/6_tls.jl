@@ -9,6 +9,7 @@ using OpenSSL_jll
 using NetworkOptions
 using EnumX: @enumx
 using ..Reseau.IOPoll
+using ..Reseau.SocketOps
 using ..Reseau.TCP
 using ..Reseau.HostResolvers
 
@@ -302,7 +303,10 @@ function _ssl_alpn_select_cb(
 end
 
 function __init__()
-    _ = ccall((:OPENSSL_init_ssl, _LIBSSL), Cint, (Culong, Ptr{Cvoid}), Culong(0), C_NULL)
+    _ = @ccall gc_safe = true _LIBSSL.OPENSSL_init_ssl(
+        Culong(0)::Culong,
+        C_NULL::Ptr{Cvoid},
+    )::Cint
     handle = Base.Libc.Libdl.dlopen(_LIBSSL)
     _VERIFY_ALLOW_ALL_CB[] = @cfunction(_verify_allow_all_cb, Cint, (Cint, Ptr{Cvoid}))
     _ALPN_SELECT_CB[] = @cfunction(_ssl_alpn_select_cb, Cint, (Ptr{Cvoid}, Ptr{Ptr{UInt8}}, Ptr{UInt8}, Ptr{UInt8}, Cuint, Ptr{Cvoid}))
@@ -621,19 +625,32 @@ function _ssl_ctx_new(config::Config; is_server::Bool)::Ptr{Cvoid}
         if need_verify_paths
             ca_path = _effective_ca_file(config; is_server = is_server)
             if ca_path === nothing
-                ok = ccall((:SSL_CTX_set_default_verify_paths, _LIBSSL), Cint, (Ptr{Cvoid},), ctx)
+                ok = @ccall gc_safe = true _LIBSSL.SSL_CTX_set_default_verify_paths(
+                    ctx::Ptr{Cvoid},
+                )::Cint
                 ok == 1 || throw(_make_tls_error("SSL_CTX_set_default_verify_paths", Int32(ok)))
             else
-                ok = ccall((:SSL_CTX_load_verify_locations, _LIBSSL), Cint, (Ptr{Cvoid}, Cstring, Cstring), ctx, ca_path, C_NULL)
+                ok = @ccall gc_safe = true _LIBSSL.SSL_CTX_load_verify_locations(
+                    ctx::Ptr{Cvoid},
+                    ca_path::Cstring,
+                    C_NULL::Cstring,
+                )::Cint
                 ok == 1 || throw(_make_tls_error("SSL_CTX_load_verify_locations", Int32(ok)))
             end
         end
         if is_server
             cert_file = config.cert_file::String
             key_file = config.key_file::String
-            ok = ccall((:SSL_CTX_use_certificate_chain_file, _LIBSSL), Cint, (Ptr{Cvoid}, Cstring), ctx, cert_file)
+            ok = @ccall gc_safe = true _LIBSSL.SSL_CTX_use_certificate_chain_file(
+                ctx::Ptr{Cvoid},
+                cert_file::Cstring,
+            )::Cint
             ok == 1 || throw(_make_tls_error("SSL_CTX_use_certificate_chain_file", Int32(ok)))
-            ok = ccall((:SSL_CTX_use_PrivateKey_file, _LIBSSL), Cint, (Ptr{Cvoid}, Cstring, Cint), ctx, key_file, _SSL_FILETYPE_PEM)
+            ok = @ccall gc_safe = true _LIBSSL.SSL_CTX_use_PrivateKey_file(
+                ctx::Ptr{Cvoid},
+                key_file::Cstring,
+                _SSL_FILETYPE_PEM::Cint,
+            )::Cint
             ok == 1 || throw(_make_tls_error("SSL_CTX_use_PrivateKey_file", Int32(ok)))
             ok = ccall((:SSL_CTX_check_private_key, _LIBSSL), Cint, (Ptr{Cvoid},), ctx)
             ok == 1 || throw(_make_tls_error("SSL_CTX_check_private_key", Int32(ok)))
@@ -667,9 +684,16 @@ function _ssl_ctx_new(config::Config; is_server::Bool)::Ptr{Cvoid}
             if config.cert_file !== nothing
                 cert_file = config.cert_file::String
                 key_file = config.key_file::String
-                ok = ccall((:SSL_CTX_use_certificate_chain_file, _LIBSSL), Cint, (Ptr{Cvoid}, Cstring), ctx, cert_file)
+                ok = @ccall gc_safe = true _LIBSSL.SSL_CTX_use_certificate_chain_file(
+                    ctx::Ptr{Cvoid},
+                    cert_file::Cstring,
+                )::Cint
                 ok == 1 || throw(_make_tls_error("SSL_CTX_use_certificate_chain_file", Int32(ok)))
-                ok = ccall((:SSL_CTX_use_PrivateKey_file, _LIBSSL), Cint, (Ptr{Cvoid}, Cstring, Cint), ctx, key_file, _SSL_FILETYPE_PEM)
+                ok = @ccall gc_safe = true _LIBSSL.SSL_CTX_use_PrivateKey_file(
+                    ctx::Ptr{Cvoid},
+                    key_file::Cstring,
+                    _SSL_FILETYPE_PEM::Cint,
+                )::Cint
                 ok == 1 || throw(_make_tls_error("SSL_CTX_use_PrivateKey_file", Int32(ok)))
                 ok = ccall((:SSL_CTX_check_private_key, _LIBSSL), Cint, (Ptr{Cvoid},), ctx)
                 ok == 1 || throw(_make_tls_error("SSL_CTX_check_private_key", Int32(ok)))
@@ -803,7 +827,7 @@ function _wait_ssl_ready!(conn::Conn, ssl_err::Cint, op::AbstractString)
         return true
     end
     if ssl_err == _SSL_ERROR_SYSCALL
-        errno = Int32(Base.Libc.errno())
+        errno = SocketOps.last_error()
         if _is_socket_would_block(errno)
             IOPoll.wait_read!(conn.tcp.fd.pfd.pd)
             return true
@@ -885,7 +909,9 @@ function handshake!(conn::Conn)
             _with_handshake_deadline(conn) do
                 while true
                     _ensure_open!(conn, "handshake")
-                    ret = ccall((:SSL_do_handshake, _LIBSSL), Cint, (Ptr{Cvoid},), conn.ssl)
+                    ret = @ccall gc_safe = true _LIBSSL.SSL_do_handshake(
+                        conn.ssl::Ptr{Cvoid},
+                    )::Cint
                     if ret == 1
                         _set_handshake_complete!(conn)
                         return nothing
@@ -928,14 +954,11 @@ function Base.read!(conn::Conn, buf::Vector{UInt8})::Int
     try
         _ensure_open!(conn, "read")
         while true
-            ret = GC.@preserve buf ccall(
-                (:SSL_read, _LIBSSL),
-                Cint,
-                (Ptr{Cvoid}, Ptr{UInt8}, Cint),
-                conn.ssl,
-                pointer(buf),
-                Cint(length(buf)),
-            )
+            ret = GC.@preserve buf @ccall gc_safe = true _LIBSSL.SSL_read(
+                conn.ssl::Ptr{Cvoid},
+                pointer(buf)::Ptr{UInt8},
+                Cint(length(buf))::Cint,
+            )::Cint
             if ret > 0
                 return Int(ret)
             end
@@ -980,14 +1003,11 @@ function _write!(conn::Conn, buf, nbytes::Integer)::Int
             base_ptr = pointer(buf)
             while total < nbytes_int
                 chunk_len = nbytes_int - total
-                wrote = ccall(
-                    (:SSL_write, _LIBSSL),
-                    Cint,
-                    (Ptr{Cvoid}, Ptr{UInt8}, Cint),
-                    conn.ssl,
-                    base_ptr + total,
-                    Cint(chunk_len),
-                )
+                wrote = @ccall gc_safe = true _LIBSSL.SSL_write(
+                    conn.ssl::Ptr{Cvoid},
+                    (base_ptr + total)::Ptr{UInt8},
+                    Cint(chunk_len)::Cint,
+                )::Cint
                 if wrote > 0
                     total += Int(wrote)
                     continue
@@ -1023,7 +1043,9 @@ function _ssl_shutdown!(conn::Conn)
     catch
     end
     for _ in 1:4
-        ret = ccall((:SSL_shutdown, _LIBSSL), Cint, (Ptr{Cvoid},), conn.ssl)
+        ret = @ccall gc_safe = true _LIBSSL.SSL_shutdown(
+            conn.ssl::Ptr{Cvoid},
+        )::Cint
         if ret == 1 || ret == 0
             return nothing
         end

@@ -7,6 +7,7 @@ module HostResolvers
 
 using ..Reseau.SocketOps
 using ..Reseau.IOPoll
+
 using ..Reseau.TCP
 
 """
@@ -243,12 +244,17 @@ const _HR_AF_INET = SocketOps.AF_INET
 const _HR_AF_INET6 = SocketOps.AF_INET6
 
 @inline function _gai_error_string(code::Cint)::String
-    ptr = ccall(:gai_strerror, Cstring, (Cint,), code)
+    ptr = @static if Sys.iswindows()
+        ccall((:gai_strerrorA, "Ws2_32"), Cstring, (Cint,), code)
+    else
+        ccall(:gai_strerror, Cstring, (Cint,), code)
+    end
     ptr == C_NULL && return "unknown getaddrinfo error code $code"
     return unsafe_string(ptr)
 end
 
 function _native_getaddrinfo(hostname::AbstractString; flags::Cint = Cint(0))::Vector{TCP.SocketEndpoint}
+    SocketOps.ensure_winsock!()
     addresses = TCP.SocketEndpoint[]
     hints = Ref{_AddrInfo}()
     hints_ptr = Base.unsafe_convert(Ptr{_AddrInfo}, hints)
@@ -261,12 +267,21 @@ function _native_getaddrinfo(hostname::AbstractString; flags::Cint = Cint(0))::V
     end
     result_ptr = Ref{Ptr{_AddrInfo}}(C_NULL)
     ret = GC.@preserve hints begin
-        @ccall gc_safe = true getaddrinfo(
-            String(hostname)::Cstring,
-            C_NULL::Cstring,
-            hints_ptr::Ptr{_AddrInfo},
-            result_ptr::Ptr{Ptr{_AddrInfo}},
-        )::Cint
+        @static if Sys.iswindows()
+            @ccall gc_safe = true "Ws2_32".getaddrinfo(
+                String(hostname)::Cstring,
+                C_NULL::Cstring,
+                hints_ptr::Ptr{_AddrInfo},
+                result_ptr::Ptr{Ptr{_AddrInfo}},
+            )::Cint
+        else
+            @ccall gc_safe = true getaddrinfo(
+                String(hostname)::Cstring,
+                C_NULL::Cstring,
+                hints_ptr::Ptr{_AddrInfo},
+                result_ptr::Ptr{Ptr{_AddrInfo}},
+            )::Cint
+        end
     end
     ret == 0 || _addr_error("lookup failed: $(_gai_error_string(ret))", String(hostname))
     try
@@ -289,7 +304,13 @@ function _native_getaddrinfo(hostname::AbstractString; flags::Cint = Cint(0))::V
             current = ai.ai_next
         end
     finally
-        result_ptr[] != C_NULL && ccall(:freeaddrinfo, Cvoid, (Ptr{_AddrInfo},), result_ptr[])
+        if result_ptr[] != C_NULL
+            @static if Sys.iswindows()
+                ccall((:freeaddrinfo, "Ws2_32"), Cvoid, (Ptr{_AddrInfo},), result_ptr[])
+            else
+                ccall(:freeaddrinfo, Cvoid, (Ptr{_AddrInfo},), result_ptr[])
+            end
+        end
     end
     return addresses
 end
@@ -824,6 +845,13 @@ end
     return Int64(300_000_000)
 end
 
+@inline function _use_parallel_race(d::HostResolver, kind::Symbol, fallbacks::Vector{TCP.SocketEndpoint})::Bool
+    _dual_stack_enabled(d) || return false
+    kind == :tcp || return false
+    isempty(fallbacks) && return false
+    return true
+end
+
 function _connect_deadline_ns(d::HostResolver)::Int64
     now = Int64(time_ns())
     timeout_deadline = d.timeout_ns == 0 ? Int64(0) : now + d.timeout_ns
@@ -915,6 +943,12 @@ function _partition_addrs(addrs::Vector{TCP.SocketEndpoint})::Tuple{Vector{TCP.S
         end
     end
     return primaries, fallbacks
+end
+
+@inline function _prefer_ipv4_first!(addrs::Vector{TCP.SocketEndpoint}, policy::ResolverPolicy)
+    _ = addrs
+    _ = policy
+    return nothing
 end
 
 @inline function _wrap_op_error(
@@ -1138,10 +1172,11 @@ function connect(d::HostResolver, network::AbstractString, address::AbstractStri
     if deadline_ns != 0 && Int64(time_ns()) >= deadline_ns
         throw(_wrap_op_error("connect", network, d.local_addr, nothing, DNSTimeoutError(String(address))))
     end
+    _prefer_ipv4_first!(addrs, d.policy)
     primaries, fallbacks = _partition_addrs(addrs)
     conn = nothing
     err = nothing
-    if _dual_stack_enabled(d) && kind == :tcp && !isempty(fallbacks)
+    if _use_parallel_race(d, kind, fallbacks)
         conn, err = _resolve_parallel(d, network, address, primaries, fallbacks, deadline_ns)
     else
         state = DNSRaceState()
