@@ -107,6 +107,7 @@ closed.
 mutable struct Transport
     host_resolver::HostResolvers.HostResolver
     tls_config::Union{Nothing, TLS.Config}
+    proxy::ProxyConfig
     max_idle_per_host::Int
     max_idle_total::Int
     idle_timeout_ns::Int64
@@ -139,6 +140,7 @@ end
 function Transport(;
         host_resolver::HostResolvers.HostResolver = HostResolvers.HostResolver(),
         tls_config::Union{Nothing, TLS.Config} = nothing,
+        proxy = nothing,
         max_idle_per_host::Integer = 2,
         max_idle_total::Integer = 64,
         idle_timeout_ns::Integer = Int64(90_000_000_000),
@@ -149,6 +151,7 @@ function Transport(;
     return Transport(
         host_resolver,
         tls_config,
+        _normalize_proxy_config(proxy),
         Int(max_idle_per_host),
         Int(max_idle_total),
         Int64(idle_timeout_ns),
@@ -228,15 +231,63 @@ function _effective_tls_config(transport::Transport, address::String, server_nam
     )
 end
 
-function _new_conn!(transport::Transport, key::String, address::String; secure::Bool, server_name::Union{Nothing, String})::ClientConn
-    tcp = TCP.connect(transport.host_resolver, "tcp", address)
+function _write_request_bytes!(stream, request_io::IOBuffer)
+    request_bytes = request_io.size
+    n = write(stream, request_io.data, request_bytes)
+    n == request_bytes || throw(ProtocolError("transport short write"))
+    return nothing
+end
+
+function _perform_http_connect_tunnel!(
+        tcp::TCP.Conn,
+        proxy::_ProxyTarget,
+        target_address::String,
+        deadline_ns::Int64,
+    )::Nothing
+    deadline_ns == 0 || TCP.set_deadline!(tcp, deadline_ns)
+    headers = Headers()
+    set_header!(headers, "Host", target_address)
+    proxy.authorization === nothing || set_header!(headers, "Proxy-Authorization", proxy.authorization::String)
+    request = Request(
+        "CONNECT",
+        target_address;
+        headers = headers,
+        host = target_address,
+        content_length = 0,
+    )
+    request_io = IOBuffer()
+    write_request!(request_io, request)
+    _write_request_bytes!(tcp, request_io)
+    response = _read_incoming_response(_ConnReader(tcp), request)
+    try
+        body_close!(response.rawbody)
+    catch
+    end
+    response.head.status_code == 200 || throw(ProtocolError("proxy CONNECT failed with status $(response.head.status_code)"))
+    return nothing
+end
+
+function _new_conn!(
+        transport::Transport,
+        plan::_ProxyPlan,
+        address::String;
+        secure::Bool,
+        server_name::Union{Nothing, String},
+        deadline_ns::Int64 = Int64(0),
+    )::ClientConn
+    tcp = TCP.connect(transport.host_resolver, "tcp", plan.first_hop_address)
+    if plan.mode == _ProxyPlanMode.HTTP_TUNNEL
+        proxy = plan.proxy
+        proxy === nothing && throw(ProtocolError("proxy CONNECT tunnel is missing proxy config"))
+        _perform_http_connect_tunnel!(tcp, proxy::_ProxyTarget, address, deadline_ns)
+    end
     if secure
         cfg = _effective_tls_config(transport, address, server_name)
         tls = TLS.client(tcp, cfg)
         TLS.handshake!(tls)
-        return ClientConn(key, address, true, tcp, tls, _ConnReader(tls), IOBuffer(), false, false, time_ns())
+        return ClientConn(plan.pool_key, plan.first_hop_address, true, tcp, tls, _ConnReader(tls), IOBuffer(), false, false, time_ns())
     end
-    return ClientConn(key, address, false, tcp, nothing, _ConnReader(tcp), IOBuffer(), false, false, time_ns())
+    return ClientConn(plan.pool_key, plan.first_hop_address, false, tcp, nothing, _ConnReader(tcp), IOBuffer(), false, false, time_ns())
 end
 
 function _evict_expired_idle_locked!(transport::Transport, key::String, now_ns::Int64)
@@ -260,17 +311,24 @@ function _evict_expired_idle_locked!(transport::Transport, key::String, now_ns::
     return nothing
 end
 
-function _acquire_conn!(transport::Transport, key::String, address::String; secure::Bool, server_name::Union{Nothing, String})::ClientConn
+function _acquire_conn!(
+        transport::Transport,
+        plan::_ProxyPlan,
+        address::String;
+        secure::Bool,
+        server_name::Union{Nothing, String},
+        deadline_ns::Int64 = Int64(0),
+    )::ClientConn
     _transport_closed(transport) && throw(ProtocolError("transport is closed"))
     lock(transport.lock)
     try
         now_ns = Int64(time_ns())
-        _evict_expired_idle_locked!(transport, key, now_ns)
-        idle_list = get(() -> nothing, transport.idle, key)
+        _evict_expired_idle_locked!(transport, plan.pool_key, now_ns)
+        idle_list = get(() -> nothing, transport.idle, plan.pool_key)
         if idle_list !== nothing && !isempty(idle_list::Vector{ClientConn})
             conn = pop!(idle_list::Vector{ClientConn})
             @atomic :acquire_release transport.idle_total -= 1
-            isempty(idle_list::Vector{ClientConn}) && delete!(transport.idle, key)
+            isempty(idle_list::Vector{ClientConn}) && delete!(transport.idle, plan.pool_key)
             if !_conn_closed(conn)
                 conn.reused = true
                 return conn
@@ -280,7 +338,7 @@ function _acquire_conn!(transport::Transport, key::String, address::String; secu
     finally
         unlock(transport.lock)
     end
-    return _new_conn!(transport, key, address; secure = secure, server_name = server_name)
+    return _new_conn!(transport, plan, address; secure = secure, server_name = server_name, deadline_ns = deadline_ns)
 end
 
 function _put_idle_conn!(transport::Transport, conn::ClientConn)
@@ -551,20 +609,30 @@ function _roundtrip_incoming!(
         request::Request;
         secure::Bool = false,
         server_name::Union{Nothing, AbstractString} = nothing,
+        proxy_config::ProxyConfig = transport.proxy,
     )
-    key = string(secure ? "https://" : "http://", address)
     request_deadline = _request_deadline_ns(request)
     retry_template = _retryable_request(request) ? _copy_request(request) : nothing
     attempt = 1
     current_request = request
     while true
-        conn = _acquire_conn!(transport, key, String(address); secure = secure, server_name = server_name === nothing ? nothing : String(server_name))
+        plan = _proxy_plan(proxy_config, secure, String(address))
+        conn = _acquire_conn!(
+            transport,
+            plan,
+            String(address);
+            secure = secure,
+            server_name = server_name === nothing ? nothing : String(server_name),
+            deadline_ns = request_deadline,
+        )
         was_reused = conn.reused
         try
             _apply_conn_deadline!(conn, request_deadline)
             request_io = _reset_request_buffer!(conn)
             try
-                write_request!(request_io, current_request)
+                wire_target = plan.mode == _ProxyPlanMode.HTTP_FORWARD ? _request_url(false, String(address), current_request.target) : nothing
+                proxy_auth = plan.mode == _ProxyPlanMode.HTTP_FORWARD && plan.proxy !== nothing ? (plan.proxy::_ProxyTarget).authorization : nothing
+                write_request!(request_io, current_request; wire_target = wire_target, proxy_authorization = proxy_auth)
             finally
                 try
                     body_close!(current_request.body)
@@ -572,9 +640,7 @@ function _roundtrip_incoming!(
                 end
             end
             stream = _conn_stream(conn)
-            request_bytes = request_io.size
-            n = write(stream, request_io.data, request_bytes)
-            n == request_bytes || throw(ProtocolError("transport short write"))
+            _write_request_bytes!(stream, request_io)
             reader = conn.reader
             raw_response = _read_incoming_response(reader, current_request)
             # HTTP/1 informational responses are consumed internally so callers
@@ -728,7 +794,7 @@ function ClientTrace(;
 end
 
 function Client(;
-        transport::Transport = Transport(),
+        transport::Transport = Transport(proxy = ProxyFromEnvironment()),
         check_redirect::Union{Nothing, Function} = nothing,
         jar::Union{Nothing, AbstractCookieJar} = MemoryCookieJar(),
         max_redirects::Integer = 10,
@@ -738,6 +804,10 @@ function Client(;
     max_redirects >= 0 || throw(ArgumentError("max_redirects must be >= 0"))
     return Client(transport, check_redirect, jar, Int(max_redirects), trace, prefer_http2, ReentrantLock(), Dict{String, H2Connection}())
 end
+
+struct _UseTransportProxy end
+
+const _USE_TRANSPORT_PROXY = _UseTransportProxy()
 
 struct _RedirectPolicy
     check_redirect::Union{Nothing, Function}
@@ -769,6 +839,11 @@ function _redirect_policy(
     return _RedirectPolicy(callback, max_redirects, method_override, preserve_method, forwardheaders)
 end
 
+function _proxy_config_for_request(client::Client, proxy)::ProxyConfig
+    proxy === _USE_TRANSPORT_PROXY && return client.transport.proxy
+    return _normalize_proxy_config(proxy)
+end
+
 function Base.close(client::Client)
     close(client.transport)
     lock(client.h2_lock)
@@ -786,17 +861,18 @@ function Base.close(client::Client)
     return nothing
 end
 
-@inline function _h2_key(address::String, secure::Bool)::String
-    return string(secure ? "https://" : "http://", address)
+@inline function _h2_key(plan::_ProxyPlan)::String
+    return string("h2|", plan.pool_key)
 end
 
 function _acquire_h2_conn!(
         client::Client,
+        plan::_ProxyPlan,
         address::String,
         secure::Bool;
         server_name::Union{Nothing, String} = nothing,
     )::H2Connection
-    key = _h2_key(address, secure)
+    key = _h2_key(plan)
     lock(client.h2_lock)
     try
         existing = get(() -> nothing, client.h2_conns, key)
@@ -829,12 +905,30 @@ function _acquire_h2_conn!(
         else
             nothing
         end
-        conn = connect_h2!(
-            address;
-            secure = secure,
-            host_resolver = client.transport.host_resolver,
-            tls_config = tls_cfg,
-        )
+        conn = if plan.mode == _ProxyPlanMode.DIRECT
+            connect_h2!(
+                address;
+                secure = secure,
+                host_resolver = client.transport.host_resolver,
+                tls_config = tls_cfg,
+            )
+        elseif plan.mode == _ProxyPlanMode.HTTP_TUNNEL
+            proxy = plan.proxy
+            proxy === nothing && throw(ProtocolError("proxy CONNECT tunnel is missing proxy config"))
+            tcp = TCP.connect(client.transport.host_resolver, "tcp", plan.first_hop_address)
+            try
+                _perform_http_connect_tunnel!(tcp, proxy::_ProxyTarget, address, Int64(0))
+                connect_h2!(tcp, address; secure = secure, tls_config = tls_cfg)
+            catch
+                try
+                    TCP.close!(tcp)
+                catch
+                end
+                rethrow()
+            end
+        else
+            throw(ArgumentError("HTTP/2 is not supported for proxy plan mode $(plan.mode)"))
+        end
         client.h2_conns[key] = conn
         return conn
     finally
@@ -846,8 +940,8 @@ end
     return err isa H2NegotiationError
 end
 
-function _drop_h2_conn!(client::Client, address::String, secure::Bool)
-    key = _h2_key(address, secure)
+function _drop_h2_conn!(client::Client, plan::_ProxyPlan)
+    key = _h2_key(plan)
     lock(client.h2_lock)
     try
         conn = get(() -> nothing, client.h2_conns, key)
@@ -1283,6 +1377,7 @@ function _do_incoming!(
         server_name::Union{Nothing, AbstractString} = nothing,
         protocol::Symbol = :auto,
         redirect_policy::_RedirectPolicy = _redirect_policy(client),
+        proxy_config::ProxyConfig = client.transport.proxy,
     )
     current_address = String(address)
     initial_address = current_address
@@ -1293,18 +1388,19 @@ function _do_incoming!(
     previous_response = nothing
     for redirect_count in 0:redirect_policy.max_redirects
         send_request = _copy_request_for_send(current_request; allow_nonreplayable = redirect_count == 0)
+        proxy_plan = _proxy_plan(proxy_config, current_secure, current_address)
         host, path = _host_path_from_request(current_address, current_request)
         if client.jar isa MemoryCookieJar
             cookie_value = _cookie_header(client.jar::MemoryCookieJar, host, path, current_secure)
             cookie_value === nothing || set_header!(send_request.headers, "Cookie", cookie_value)
         end
         _trace_call(client.trace, :on_get_conn, current_address, current_secure)
-        response = if _use_h2(client, current_secure, protocol)
+        response = if _use_h2(client, current_secure, protocol) && proxy_plan.mode != _ProxyPlanMode.HTTP_FORWARD
             try
-                conn = _acquire_h2_conn!(client, current_address, current_secure; server_name = current_server_name)
+                conn = _acquire_h2_conn!(client, proxy_plan, current_address, current_secure; server_name = current_server_name)
                 _h2_roundtrip_incoming!(conn, send_request)
             catch err
-                _drop_h2_conn!(client, current_address, current_secure)
+                _drop_h2_conn!(client, proxy_plan)
                 if protocol == :auto && _should_fallback_h2_to_h1(err)
                     _roundtrip_incoming!(
                         client.transport,
@@ -1312,6 +1408,7 @@ function _do_incoming!(
                         send_request;
                         secure = current_secure,
                         server_name = current_server_name,
+                        proxy_config = proxy_config,
                     )
                 else
                     rethrow(err)
@@ -1324,6 +1421,7 @@ function _do_incoming!(
                 send_request;
                 secure = current_secure,
                 server_name = current_server_name,
+                proxy_config = proxy_config,
             )
         end
         response = _annotate_incoming_response(
@@ -1387,6 +1485,7 @@ function do!(
         secure::Bool = false,
         server_name::Union{Nothing, AbstractString} = nothing,
         protocol::Symbol = :auto,
+        proxy = _USE_TRANSPORT_PROXY,
         redirect_limit::Union{Nothing, Integer} = nothing,
         redirect_method = nothing,
         forwardheaders::Bool = true,
@@ -1397,7 +1496,8 @@ function do!(
         redirect_method = redirect_method,
         forwardheaders = forwardheaders,
     )
-    return _streaming_response(_do_incoming!(client, address, request; secure = secure, server_name = server_name, protocol = protocol, redirect_policy = policy))
+    proxy_config = _proxy_config_for_request(client, proxy)
+    return _streaming_response(_do_incoming!(client, address, request; secure = secure, server_name = server_name, protocol = protocol, redirect_policy = policy, proxy_config = proxy_config))
 end
 
 """
@@ -1879,6 +1979,7 @@ function _client_for_request(
     transport = Transport(
         host_resolver = resolver,
         tls_config = tls_config,
+        proxy = ProxyFromEnvironment(),
         max_idle_per_host = 1,
         max_idle_total = 1,
         idle_timeout_ns = Int64(0),
@@ -1933,6 +2034,8 @@ Keyword arguments:
   `:same` to preserve the original method
 - `forwardheaders`: whether original request headers are copied onto redirect
   follow-up requests
+- `proxy`: explicit proxy override for this call; pass a proxy URL string, a
+  `ProxyConfig`, or `nothing` to force direct connections
 - `query`: optional query string or key/value collection appended to the URL
 - `response_stream`: optional sink `IO` or byte buffer written with the final response body
 - `response_body`: alias for `response_stream`
@@ -1966,6 +2069,7 @@ function request(
         redirect_limit::Union{Nothing, Integer} = nothing,
         redirect_method = nothing,
         forwardheaders::Bool = true,
+        proxy = _USE_TRANSPORT_PROXY,
         query = nothing,
         response_stream = nothing,
         response_body = response_stream,
@@ -2002,6 +2106,8 @@ function request(
         set_deadline!(req.context, Int64(time_ns()) + timeout_ns)
     end
     req_client, owns_client = _client_for_request(client; connect_timeout = connect_timeout, require_ssl_verification = require_ssl_verification)
+    client === nothing || proxy === _USE_TRANSPORT_PROXY || throw(ArgumentError("proxy override is not supported when passing an explicit Client"))
+    proxy_config = _proxy_config_for_request(req_client, proxy)
     incoming_response = nothing
     try
         if redirect
@@ -2018,6 +2124,7 @@ function request(
                     redirect_method = redirect_method,
                     forwardheaders = forwardheaders,
                 ),
+                proxy_config = proxy_config,
             )
         else
             incoming_response = _roundtrip_incoming!(
@@ -2026,6 +2133,7 @@ function request(
                 req;
                 secure = parsed.secure,
                 server_name = parsed.server_name,
+                proxy_config = proxy_config,
             )
         end
         incoming = incoming_response::_IncomingResponse
