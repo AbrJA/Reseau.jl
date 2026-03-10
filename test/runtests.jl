@@ -29,6 +29,10 @@ test_files = [
     "http1_wire_tests.jl",
     "http_cookie_tests.jl",
     "http_forms_tests.jl",
+    "http_websocket_codec_tests.jl",
+    "http_websocket_client_tests.jl",
+    "http_websocket_server_tests.jl",
+    "http_websocket_integration_tests.jl",
     "http_client_transport_tests.jl",
     "http_client_proxy_tests.jl",
     "http_client_tests.jl",
@@ -63,4 +67,8 @@ for test_file in test_files
         continue
     end
     _include_with_progress(test_file)
+end
+
+if get(ENV, "RESEAU_RUN_WEBSOCKET_AUTOBAHN", "") == "1"
+    _include_with_progress("http_websocket_autobahn.jl")
 end
