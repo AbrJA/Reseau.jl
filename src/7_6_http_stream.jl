@@ -1,5 +1,4 @@
 # Streaming HTTP client API built on top of the shared client execution path.
-export Stream
 export startread
 export closeread
 export open
@@ -15,30 +14,6 @@ Writes append request body bytes until response reading begins. After
 `startread(stream)`, reads consume the response body from the underlying
 connection using the same redirect/decompression machinery as `request(...)`.
 """
-mutable struct Stream <: IO
-    method::String
-    parsed::_URLParts
-    headers::Headers
-    client::Client
-    owns_client::Bool
-    proxy_config::ProxyConfig
-    cookies::Union{Bool, Vector{Cookie}}
-    cookiejar::Union{Nothing, CookieJar}
-    redirect::Bool
-    redirect_policy::_RedirectPolicy
-    status_exception::Bool
-    protocol::Symbol
-    decompress::Union{Nothing, Bool}
-    readtimeout::Float64
-    request_buffer::IOBuffer
-    response::Union{Nothing, Response}
-    reader::Union{Nothing, IO}
-    producer::Union{Nothing, Task}
-    @atomic started::Bool
-    @atomic write_closed::Bool
-    @atomic read_closed::Bool
-end
-
 function Stream(
         method::AbstractString,
         parsed::_URLParts,
@@ -50,13 +25,13 @@ function Stream(
         cookiejar::Union{Nothing, CookieJar},
         redirect::Bool,
         redirect_policy::_RedirectPolicy,
-        status_exception::Bool,
         protocol::Symbol,
         decompress::Union{Nothing, Bool},
         readtimeout::Real,
     )
     readtimeout >= 0 || throw(ArgumentError("readtimeout must be >= 0"))
     return Stream(
+        _StreamType.CLIENT,
         String(method),
         parsed,
         headers,
@@ -67,7 +42,6 @@ function Stream(
         cookiejar,
         redirect,
         redirect_policy,
-        status_exception,
         protocol,
         decompress,
         Float64(readtimeout),
@@ -75,10 +49,27 @@ function Stream(
         nothing,
         nothing,
         nothing,
+        nothing,
+        nothing,
+        nothing,
         false,
         false,
         false,
+        false,
+        false,
+        false,
+        _ServerStreamWriteMode.UNDECIDED,
+        Int64(0),
     )
+end
+
+@inline function _stream_is_client(stream::Stream)::Bool
+    return stream.side == _StreamType.CLIENT
+end
+
+function _require_client_stream(stream::Stream)::Nothing
+    _stream_is_client(stream) && return nothing
+    throw(ArgumentError("operation is only valid for client-side HTTP streams"))
 end
 
 function _stream_response(stream::Stream)::Response
@@ -93,7 +84,8 @@ function _stream_reader(stream::Stream)::IO
     return reader::IO
 end
 
-function _finish_stream_read!(stream::Stream; suppress_producer_errors::Bool)::Response
+function _client_finish_stream_read!(stream::Stream; suppress_producer_errors::Bool)::Response
+    _require_client_stream(stream)
     was_closed = @atomic :acquire stream.read_closed
     was_closed && return _stream_response(stream)
     @atomic :release stream.read_closed = true
@@ -121,7 +113,8 @@ function _finish_stream_read!(stream::Stream; suppress_producer_errors::Bool)::R
     return _stream_response(stream)
 end
 
-function _start_stream_read!(stream::Stream)::Response
+function _client_start_stream_read!(stream::Stream)::Response
+    _require_client_stream(stream)
     started = @atomic :acquire stream.started
     started && return _stream_response(stream)
     @atomic :release stream.started = true
@@ -176,44 +169,74 @@ response metadata for `stream` without buffering the response body.
 Subsequent reads on `stream` consume the response body. Repeated calls return
 the same response object.
 """
-function startread(stream::Stream)::Response
-    return _start_stream_read!(stream)
+function startread(stream::Stream)
+    if _stream_is_client(stream)
+        return _client_start_stream_read!(stream)
+    end
+    return _server_startread(stream)
 end
 
 function isopen(stream::Stream)::Bool
-    return !(@atomic :acquire stream.read_closed) || !(@atomic :acquire stream.write_closed)
+    if _stream_is_client(stream)
+        return !(@atomic :acquire stream.read_closed) || !(@atomic :acquire stream.write_closed)
+    end
+    return _server_isopen(stream)
+end
+
+function write(stream::Stream, data::StridedVector{UInt8})::Int
+    if _stream_is_client(stream)
+        (@atomic :acquire stream.started) && throw(ArgumentError("cannot write request body after response reading has started"))
+        (@atomic :acquire stream.write_closed) && throw(ArgumentError("request body writes are closed"))
+        return write(stream.request_buffer, data)
+    end
+    return _server_write(stream, data)
 end
 
 function write(stream::Stream, data::AbstractVector{UInt8})::Int
-    (@atomic :acquire stream.started) && throw(ArgumentError("cannot write request body after response reading has started"))
-    (@atomic :acquire stream.write_closed) && throw(ArgumentError("request body writes are closed"))
-    return write(stream.request_buffer, data)
+    if _stream_is_client(stream)
+        (@atomic :acquire stream.started) && throw(ArgumentError("cannot write request body after response reading has started"))
+        (@atomic :acquire stream.write_closed) && throw(ArgumentError("request body writes are closed"))
+        return write(stream.request_buffer, Vector{UInt8}(data))
+    end
+    return _server_write(stream, data)
 end
 
 function write(stream::Stream, data::Union{String, SubString{String}})::Int
-    (@atomic :acquire stream.started) && throw(ArgumentError("cannot write request body after response reading has started"))
-    (@atomic :acquire stream.write_closed) && throw(ArgumentError("request body writes are closed"))
-    return write(stream.request_buffer, data)
+    if _stream_is_client(stream)
+        (@atomic :acquire stream.started) && throw(ArgumentError("cannot write request body after response reading has started"))
+        (@atomic :acquire stream.write_closed) && throw(ArgumentError("request body writes are closed"))
+        return write(stream.request_buffer, data)
+    end
+    return _server_write(stream, data)
 end
 
 function closewrite(stream::Stream)
-    @atomic :release stream.write_closed = true
-    return nothing
+    if _stream_is_client(stream)
+        @atomic :release stream.write_closed = true
+        return nothing
+    end
+    return _server_closewrite(stream)
 end
 
 function readbytes!(stream::Stream, dest::AbstractVector{UInt8}, nb::Integer = length(dest))
     nb >= 0 || throw(ArgumentError("nb must be >= 0"))
-    _start_stream_read!(stream)
-    n = readbytes!(_stream_reader(stream), dest, nb)
-    n == 0 && _finish_stream_read!(stream; suppress_producer_errors = false)
-    return n
+    if _stream_is_client(stream)
+        _client_start_stream_read!(stream)
+        n = readbytes!(_stream_reader(stream), dest, nb)
+        n == 0 && _client_finish_stream_read!(stream; suppress_producer_errors = false)
+        return n
+    end
+    return _server_readbytes!(stream, dest, nb)
 end
 
 function read(stream::Stream)::Vector{UInt8}
-    _start_stream_read!(stream)
-    bytes = read(_stream_reader(stream))
-    _finish_stream_read!(stream; suppress_producer_errors = false)
-    return bytes
+    if _stream_is_client(stream)
+        _client_start_stream_read!(stream)
+        bytes = read(_stream_reader(stream))
+        _client_finish_stream_read!(stream; suppress_producer_errors = false)
+        return bytes
+    end
+    return _server_read(stream)
 end
 
 function read(stream::Stream, ::Type{String})::String
@@ -221,10 +244,13 @@ function read(stream::Stream, ::Type{String})::String
 end
 
 function eof(stream::Stream)::Bool
-    _start_stream_read!(stream)
-    done = eof(_stream_reader(stream))
-    done && _finish_stream_read!(stream; suppress_producer_errors = false)
-    return done
+    if _stream_is_client(stream)
+        _client_start_stream_read!(stream)
+        done = eof(_stream_reader(stream))
+        done && _client_finish_stream_read!(stream; suppress_producer_errors = false)
+        return done
+    end
+    return _server_eof(stream)
 end
 
 """
@@ -236,21 +262,27 @@ If the response body has already been fully consumed, this is effectively a
 no-op. If unread response bytes remain, the underlying client connection is not
 reused.
 """
-function closeread(stream::Stream)::Response
-    _start_stream_read!(stream)
-    return _finish_stream_read!(stream; suppress_producer_errors = true)
+function closeread(stream::Stream)
+    if _stream_is_client(stream)
+        _client_start_stream_read!(stream)
+        return _client_finish_stream_read!(stream; suppress_producer_errors = true)
+    end
+    return _server_closeread(stream)
 end
 
 function close(stream::Stream)
-    try
-        closewrite(stream)
-    catch
+    if _stream_is_client(stream)
+        try
+            closewrite(stream)
+        catch
+        end
+        try
+            closeread(stream)
+        catch
+        end
+        return nothing
     end
-    try
-        closeread(stream)
-    catch
-    end
-    return nothing
+    return _server_close(stream)
 end
 
 """
@@ -277,7 +309,6 @@ function open(
         method::Symbol,
         url::AbstractString,
         headers = Pair{String, String}[];
-        status_exception::Bool = true,
         redirect::Bool = true,
         redirect_limit::Union{Nothing, Integer} = nothing,
         redirect_method = nothing,
@@ -316,7 +347,6 @@ function open(
         cookies = normalized_cookies,
         cookiejar = effective_cookiejar,
         redirect = redirect,
-        status_exception = status_exception,
         protocol = protocol,
         decompress = decompress,
         readtimeout = readtimeout,
@@ -334,6 +364,7 @@ function open(
         method::Symbol,
         url::AbstractString,
         headers = Pair{String, String}[];
+        status_exception::Bool = true,
         kwargs...,
     )
     stream = open(method, url, headers; kwargs...)
@@ -349,7 +380,7 @@ function open(
         end
     end
     response = closeread(stream)
-    if stream.status_exception && _status_throws(response)
+    if status_exception && _status_throws(response)
         throw(StatusError(response))
     end
     callback_error === nothing || throw(callback_error)
