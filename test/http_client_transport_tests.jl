@@ -1,5 +1,6 @@
 using Test
 using Reseau
+using CodecZlib
 
 const HT = Reseau.HTTP
 const NC = Reseau.TCP
@@ -27,15 +28,19 @@ function _write_all_tcp!(conn::NC.Conn, bytes::Vector{UInt8})::Nothing
 end
 
 function _write_response_to_conn!(conn::NC.Conn, request::HT.Request; body_text::String, close_conn::Bool = false)::Nothing
-    headers = HT.Headers()
-    close_conn && HT.setheader(headers, "Connection", "close")
     payload = collect(codeunits(body_text))
+    return _write_response_bytes_to_conn!(conn, request; body_bytes = payload, close_conn = close_conn)
+end
+
+function _write_response_bytes_to_conn!(conn::NC.Conn, request::HT.Request; body_bytes::Vector{UInt8}, headers::HT.Headers = HT.Headers(), close_conn::Bool = false)::Nothing
+    headers_copy = copy(headers)
+    close_conn && HT.setheader(headers_copy, "Connection", "close")
     response = HT.Response(
         200;
         reason = "OK",
-        headers = headers,
-        body = HT.BytesBody(payload),
-        content_length = length(payload),
+        headers = headers_copy,
+        body = HT.BytesBody(body_bytes),
+        content_length = length(body_bytes),
         close = close_conn,
         request = request,
     )
@@ -43,6 +48,10 @@ function _write_response_to_conn!(conn::NC.Conn, request::HT.Request; body_text:
     HT.write_response!(io, response)
     _write_all_tcp!(conn, take!(io))
     return nothing
+end
+
+function _gzip_bytes_transport(text::String)::Vector{UInt8}
+    return transcode(CodecZlib.GzipCompressor, collect(codeunits(text)))
 end
 
 function _wait_task!(task::Task; timeout_s::Float64 = 5.0)
@@ -76,6 +85,97 @@ function Base.read!(conn::_ChunkReadConn, dst::Vector{UInt8})::Int
     copyto!(dst, 1, conn.payload, conn.idx, n)
     conn.idx += n
     return n
+end
+
+mutable struct _CountingResolverTransport <: ND.AbstractResolver
+    delay_s::Float64
+    addrs::Vector{NC.SocketEndpoint}
+    lock::ReentrantLock
+    calls::Int
+end
+
+function _CountingResolverTransport(delay_s::Float64, addrs::Vector{NC.SocketEndpoint})
+    return _CountingResolverTransport(delay_s, addrs, ReentrantLock(), 0)
+end
+
+function ND.resolve_tcp_addrs(
+        resolver::_CountingResolverTransport,
+        network::AbstractString,
+        address::AbstractString;
+        op::Symbol = :connect,
+        policy::ND.ResolverPolicy = ND.ResolverPolicy(),
+    )::Vector{NC.SocketEndpoint}
+    _ = network
+    _ = address
+    _ = op
+    _ = policy
+    lock(resolver.lock)
+    try
+        resolver.calls += 1
+    finally
+        unlock(resolver.lock)
+    end
+    sleep(resolver.delay_s)
+    return copy(resolver.addrs)
+end
+
+@testset "_read_all_response_bytes caps eager preallocation" begin
+    payload = collect(codeunits("ok"))
+    body = HT.BytesBody(payload)
+    bytes = HT._read_all_response_bytes(body; content_length_hint = HT._MAX_EAGER_RESPONSE_PREALLOC + 1)
+    @test bytes == payload
+end
+
+@testset "HTTP transport constructor validates max_conns_per_host" begin
+    @test_throws ArgumentError HT.Transport(max_conns_per_host = -1)
+end
+
+@testset "HTTP client transport coalesces duplicate concurrent lookups" begin
+    listener = ND.listen("tcp", "127.0.0.1:0"; backlog = 8)
+    laddr = NC.addr(listener)::NC.SocketAddrV4
+    address = ND.join_host_port("same.test", Int(laddr.port))
+    resolver = _CountingResolverTransport(0.05, NC.SocketEndpoint[NC.loopback_addr(Int(laddr.port))])
+    singleflight = ND.SingleflightResolver(resolver)
+    host_resolver = ND.HostResolver(resolver = singleflight, timeout_ns = 1_000_000_000, fallback_delay_ns = -1)
+    server_task = errormonitor(Threads.@spawn begin
+        for _ in 1:2
+            conn = NC.accept!(listener)
+            try
+                request = HT.read_request(HT._ConnReader(conn))
+                _read_all_body_bytes(request.body)
+                _write_response_to_conn!(conn, request; body_text = "ok", close_conn = true)
+            finally
+                try
+                    NC.close!(conn)
+                catch
+                end
+            end
+        end
+        return nothing
+    end)
+    transport = HT.Transport(host_resolver = host_resolver, max_idle_per_host = 4, max_idle_total = 4)
+    try
+        req1 = HT.Request("GET", "/one"; host = address, body = HT.EmptyBody(), content_length = 0)
+        req2 = HT.Request("GET", "/two"; host = address, body = HT.EmptyBody(), content_length = 0)
+        task1 = errormonitor(Threads.@spawn HT.roundtrip!(transport, address, req1))
+        task2 = errormonitor(Threads.@spawn HT.roundtrip!(transport, address, req2))
+        @test _wait_task!(task1) === nothing
+        @test _wait_task!(task2) === nothing
+        res1 = fetch(task1)
+        res2 = fetch(task2)
+        @test String(_read_all_body_bytes(res1.body)) == "ok"
+        @test String(_read_all_body_bytes(res2.body)) == "ok"
+        _wait_task!(server_task)
+        @test resolver.calls == 1
+        @test (@atomic :acquire singleflight.actual_lookups) == 1
+        @test (@atomic :acquire singleflight.shared_hits) == 1
+    finally
+        close(transport)
+        try
+            NC.close!(listener)
+        catch
+        end
+    end
 end
 
 @testset "_ConnReader uses buffered reads for HTTP/1 parsing" begin
@@ -196,6 +296,247 @@ end
         @test String(_read_all_body_bytes(res2.body)) == "bye"
         _wait_task!(server_task)
         @test accept_count[] == 2
+        @test HT.idle_connection_count(transport) == 0
+    finally
+        close(transport)
+        try
+            NC.close!(listener)
+        catch
+        end
+    end
+end
+
+@testset "HTTP client transport keep-alive reuse with gzip decompression" begin
+    listener = ND.listen("tcp", "127.0.0.1:0"; backlog = 8)
+    laddr = NC.addr(listener)::NC.SocketAddrV4
+    address = ND.join_host_port("127.0.0.1", Int(laddr.port))
+    base_url = "http://$(address)"
+    accept_count = Ref(0)
+    paths = String[]
+    server_task = errormonitor(Threads.@spawn begin
+        conn = NC.accept!(listener)
+        accept_count[] += 1
+        try
+            for _ in 1:2
+                request = HT.read_request(HT._ConnReader(conn))
+                push!(paths, request.target)
+                _read_all_body_bytes(request.body)
+                headers = HT.Headers()
+                HT.setheader(headers, "Content-Encoding", "gzip")
+                _write_response_bytes_to_conn!(
+                    conn,
+                    request;
+                    body_bytes = _gzip_bytes_transport("gzip-ok"),
+                    headers = headers,
+                )
+            end
+        finally
+            try
+                NC.close!(conn)
+            catch
+            end
+        end
+        return nothing
+    end)
+    transport = HT.Transport(max_idle_per_host = 4, max_idle_total = 4)
+    client = HT.Client(transport = transport)
+    try
+        res1 = HT.get("$(base_url)/one"; client = client)
+        @test String(res1.body) == "gzip-ok"
+        res2 = HT.get("$(base_url)/two"; client = client)
+        @test String(res2.body) == "gzip-ok"
+        _wait_task!(server_task)
+        @test accept_count[] == 1
+        @test paths == ["/one", "/two"]
+        @test HT.idle_connection_count(transport; key = "http://$address") == 1
+    finally
+        close(client)
+        try
+            NC.close!(listener)
+        catch
+        end
+    end
+end
+
+@testset "HTTP client transport hands off waiting acquire under host cap" begin
+    listener = ND.listen("tcp", "127.0.0.1:0"; backlog = 8)
+    laddr = NC.addr(listener)::NC.SocketAddrV4
+    address = ND.join_host_port("127.0.0.1", Int(laddr.port))
+    accept_count = Ref(0)
+    paths = String[]
+    server_task = errormonitor(Threads.@spawn begin
+        conn = NC.accept!(listener)
+        accept_count[] += 1
+        try
+            req1 = HT.read_request(HT._ConnReader(conn))
+            push!(paths, req1.target)
+            _read_all_body_bytes(req1.body)
+            _write_response_to_conn!(conn, req1; body_text = "first")
+            req2 = HT.read_request(HT._ConnReader(conn))
+            push!(paths, req2.target)
+            _read_all_body_bytes(req2.body)
+            _write_response_to_conn!(conn, req2; body_text = "second", close_conn = true)
+        finally
+            try
+                NC.close!(conn)
+            catch
+            end
+        end
+        return nothing
+    end)
+    transport = HT.Transport(max_idle_per_host = 1, max_idle_total = 1, max_conns_per_host = 1)
+    try
+        req1 = HT.Request("GET", "/one"; host = address, body = HT.EmptyBody(), content_length = 0)
+        res1 = HT.roundtrip!(transport, address, req1)
+        @test res1.status_code == 200
+
+        req2 = HT.Request("GET", "/two"; host = address, body = HT.EmptyBody(), content_length = 0)
+        res2_task = errormonitor(Threads.@spawn HT.roundtrip!(transport, address, req2))
+        @test timedwait(() -> istaskdone(res2_task), 0.05; pollint = 0.001) == :timed_out
+
+        @test String(_read_all_body_bytes(res1.body)) == "first"
+
+        res2 = fetch(res2_task)
+        @test res2.status_code == 200
+        @test String(_read_all_body_bytes(res2.body)) == "second"
+        _wait_task!(server_task)
+        @test accept_count[] == 1
+        @test paths == ["/one", "/two"]
+        @test HT.idle_connection_count(transport) == 0
+    finally
+        close(transport)
+        try
+            NC.close!(listener)
+        catch
+        end
+    end
+end
+
+@testset "HTTP client transport wakes waiter to redial after early close under host cap" begin
+    listener = ND.listen("tcp", "127.0.0.1:0"; backlog = 8)
+    laddr = NC.addr(listener)::NC.SocketAddrV4
+    address = ND.join_host_port("127.0.0.1", Int(laddr.port))
+    accept_count = Ref(0)
+    same_conn_second_request = Ref(false)
+    server_task = errormonitor(Threads.@spawn begin
+        conn1 = NC.accept!(listener)
+        accept_count[] += 1
+        try
+            req1 = HT.read_request(HT._ConnReader(conn1))
+            _read_all_body_bytes(req1.body)
+            _write_response_to_conn!(conn1, req1; body_text = "first-response")
+            NC.set_read_deadline!(conn1, Int64(time_ns()) + 300_000_000)
+            try
+                req_maybe = HT.read_request(HT._ConnReader(conn1))
+                same_conn_second_request[] = true
+                _read_all_body_bytes(req_maybe.body)
+                _write_response_to_conn!(conn1, req_maybe; body_text = "unexpected")
+            catch err
+                if !(err isa EOFError || err isa SystemError || err isa Reseau.IOPoll.DeadlineExceededError || err isa Reseau.IOPoll.NetClosingError || err isa HT.ParseError || err isa HT.ProtocolError)
+                    rethrow(err)
+                end
+            end
+        finally
+            try
+                NC.close!(conn1)
+            catch
+            end
+        end
+        conn2 = NC.accept!(listener)
+        accept_count[] += 1
+        try
+            req2 = HT.read_request(HT._ConnReader(conn2))
+            _read_all_body_bytes(req2.body)
+            _write_response_to_conn!(conn2, req2; body_text = "second-response", close_conn = true)
+        finally
+            try
+                NC.close!(conn2)
+            catch
+            end
+        end
+        return nothing
+    end)
+    transport = HT.Transport(max_idle_per_host = 1, max_idle_total = 1, max_conns_per_host = 1)
+    try
+        req1 = HT.Request("GET", "/one"; host = address, body = HT.EmptyBody(), content_length = 0)
+        res1 = HT.roundtrip!(transport, address, req1)
+        @test res1.status_code == 200
+
+        req2 = HT.Request("GET", "/two"; host = address, body = HT.EmptyBody(), content_length = 0)
+        res2_task = errormonitor(Threads.@spawn HT.roundtrip!(transport, address, req2))
+        @test timedwait(() -> istaskdone(res2_task), 0.05; pollint = 0.001) == :timed_out
+
+        first_byte = Vector{UInt8}(undef, 1)
+        @test HT.body_read!(res1.body, first_byte) == 1
+        HT.body_close!(res1.body)
+
+        res2 = fetch(res2_task)
+        @test res2.status_code == 200
+        @test String(_read_all_body_bytes(res2.body)) == "second-response"
+        _wait_task!(server_task)
+        @test accept_count[] == 2
+        @test !same_conn_second_request[]
+        @test HT.idle_connection_count(transport) == 0
+    finally
+        close(transport)
+        try
+            NC.close!(listener)
+        catch
+        end
+    end
+end
+
+@testset "HTTP client transport waiter honors request deadline under host cap" begin
+    listener = ND.listen("tcp", "127.0.0.1:0"; backlog = 8)
+    laddr = NC.addr(listener)::NC.SocketAddrV4
+    address = ND.join_host_port("127.0.0.1", Int(laddr.port))
+    accept_count = Ref(0)
+    second_request_seen = Ref(false)
+    server_task = errormonitor(Threads.@spawn begin
+        conn = NC.accept!(listener)
+        accept_count[] += 1
+        try
+            req1 = HT.read_request(HT._ConnReader(conn))
+            _read_all_body_bytes(req1.body)
+            _write_response_to_conn!(conn, req1; body_text = "first")
+            NC.set_read_deadline!(conn, Int64(time_ns()) + 300_000_000)
+            try
+                req2 = HT.read_request(HT._ConnReader(conn))
+                second_request_seen[] = true
+                _read_all_body_bytes(req2.body)
+            catch err
+                if !(err isa EOFError || err isa SystemError || err isa Reseau.IOPoll.DeadlineExceededError || err isa Reseau.IOPoll.NetClosingError || err isa HT.ParseError || err isa HT.ProtocolError)
+                    rethrow(err)
+                end
+            end
+        finally
+            try
+                NC.close!(conn)
+            catch
+            end
+        end
+        return nothing
+    end)
+    transport = HT.Transport(max_idle_per_host = 1, max_idle_total = 1, max_conns_per_host = 1)
+    try
+        req1 = HT.Request("GET", "/one"; host = address, body = HT.EmptyBody(), content_length = 0)
+        res1 = HT.roundtrip!(transport, address, req1)
+        @test res1.status_code == 200
+
+        req2 = HT.Request("GET", "/two"; host = address, body = HT.EmptyBody(), content_length = 0)
+        HT.set_deadline!(req2.context, Int64(time_ns()) + 50_000_000)
+        err = try
+            HT.roundtrip!(transport, address, req2)
+            nothing
+        catch caught
+            caught
+        end
+        @test err isa Reseau.IOPoll.DeadlineExceededError
+
+        HT.body_close!(res1.body)
+        _wait_task!(server_task)
+        @test accept_count[] == 1
+        @test !second_request_seen[]
         @test HT.idle_connection_count(transport) == 0
     finally
         close(transport)

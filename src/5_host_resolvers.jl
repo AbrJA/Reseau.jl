@@ -123,6 +123,107 @@ This is the default resolver used by the convenience APIs.
 """
 struct SystemResolver <: AbstractResolver end
 
+mutable struct _LookupFlight
+    lock::ReentrantLock
+    cond::Threads.Condition
+    result::Union{Nothing, Vector{TCP.SocketEndpoint}}
+    err::Union{Nothing, Exception}
+    @atomic done::Bool
+    function _LookupFlight()
+        lock = ReentrantLock()
+        return new(lock, Threads.Condition(lock), nothing, nothing, false)
+    end
+end
+
+"""
+    SingleflightResolver(parent)
+
+Resolver wrapper that coalesces concurrent duplicate hostname lookups for the
+same `(network, host)` pair while preserving caller-local timeout and connect
+behavior outside the raw lookup step.
+"""
+mutable struct SingleflightResolver{R <: AbstractResolver} <: AbstractResolver
+    parent::R
+    lock::ReentrantLock
+    inflight::Dict{Tuple{String, String}, _LookupFlight}
+    @atomic actual_lookups::Int
+    @atomic shared_hits::Int
+end
+
+function SingleflightResolver(parent::R) where {R <: AbstractResolver}
+    return SingleflightResolver{R}(parent, ReentrantLock(), Dict{Tuple{String, String}, _LookupFlight}(), 0, 0)
+end
+
+mutable struct _LookupCacheEntry
+    result::Union{Nothing, Vector{TCP.SocketEndpoint}}
+    err::Union{Nothing, Exception}
+    expires_ns::Int64
+    stale_expires_ns::Int64
+    last_access_ns::Int64
+    refreshing::Bool
+end
+
+"""
+    CachingResolver(; parent=SystemResolver(), ttl_ns, stale_ttl_ns, negative_ttl_ns, max_hosts)
+    CachingResolver(parent; ttl_ns, stale_ttl_ns, negative_ttl_ns, max_hosts)
+
+Explicit opt-in hostname cache with policy TTLs.
+
+This caches positive host-IP lookups for `ttl_ns`, may serve stale positives for
+up to `stale_ttl_ns` while refreshing in the background, and may cache
+`AddressError` failures for `negative_ttl_ns`. `max_hosts` bounds the number of
+cached host keys and evicts the least-recently-used entry when full.
+"""
+mutable struct CachingResolver{R <: AbstractResolver} <: AbstractResolver
+    parent::R
+    ttl_ns::Int64
+    stale_ttl_ns::Int64
+    negative_ttl_ns::Int64
+    max_hosts::Int
+    lock::ReentrantLock
+    entries::Dict{Tuple{String, String}, _LookupCacheEntry}
+    @atomic cache_hits::Int
+    @atomic stale_hits::Int
+    @atomic negative_hits::Int
+    @atomic misses::Int
+end
+
+function CachingResolver(
+        parent::R;
+        ttl_ns::Integer = Int64(5_000_000_000),
+        stale_ttl_ns::Integer = Int64(0),
+        negative_ttl_ns::Integer = Int64(0),
+        max_hosts::Integer = 1024,
+    ) where {R <: AbstractResolver}
+    ttl_ns >= 0 || throw(ArgumentError("ttl_ns must be >= 0"))
+    stale_ttl_ns >= 0 || throw(ArgumentError("stale_ttl_ns must be >= 0"))
+    negative_ttl_ns >= 0 || throw(ArgumentError("negative_ttl_ns must be >= 0"))
+    max_hosts > 0 || throw(ArgumentError("max_hosts must be > 0"))
+    return CachingResolver{R}(
+        parent,
+        Int64(ttl_ns),
+        Int64(stale_ttl_ns),
+        Int64(negative_ttl_ns),
+        Int(max_hosts),
+        ReentrantLock(),
+        Dict{Tuple{String, String}, _LookupCacheEntry}(),
+        0,
+        0,
+        0,
+        0,
+    )
+end
+
+function CachingResolver(;
+        parent::AbstractResolver = SystemResolver(),
+        ttl_ns::Integer = Int64(5_000_000_000),
+        stale_ttl_ns::Integer = Int64(0),
+        negative_ttl_ns::Integer = Int64(0),
+        max_hosts::Integer = 1024,
+    )
+    return CachingResolver(parent; ttl_ns = ttl_ns, stale_ttl_ns = stale_ttl_ns, negative_ttl_ns = negative_ttl_ns, max_hosts = max_hosts)
+end
+
 """
     StaticResolver
 
@@ -619,6 +720,11 @@ function lookup_port(network::AbstractString, service::AbstractString)::Int
     return lookup_port(DEFAULT_RESOLVER, network, service)
 end
 
+function lookup_port(resolver::AbstractResolver, network::AbstractString, service::AbstractString)::Int
+    _ = resolver
+    return lookup_port(DEFAULT_RESOLVER, network, service)
+end
+
 function lookup_port(::SystemResolver, network::AbstractString, service::AbstractString)::Int
     port, needs_lookup = parse_port(service)
     if needs_lookup
@@ -729,21 +835,288 @@ function _resolve_system_host(host::AbstractString)::Vector{TCP.SocketEndpoint}
 end
 
 function _resolve_static_host(resolver::StaticResolver, host::AbstractString)::Vector{TCP.SocketEndpoint}
+    return _resolve_static_host(resolver, "tcp", host)
+end
+
+function _resolve_static_host(
+        resolver::StaticResolver,
+        network::AbstractString,
+        host::AbstractString,
+    )::Vector{TCP.SocketEndpoint}
     h = String(host)
     literal = _literal_host_addr(h)
     literal === nothing || return TCP.SocketEndpoint[literal]
     mapped = get(() -> nothing, resolver.hosts, lowercase(h))
     mapped === nothing || return copy(mapped::Vector{TCP.SocketEndpoint})
     resolver.fallback === nothing && _addr_error("no suitable address", h)
-    return _resolve_host_ips(resolver.fallback::AbstractResolver, h)
+    return _resolve_host_ips(resolver.fallback::AbstractResolver, network, h)
 end
 
 function _resolve_host_ips(resolver::AbstractResolver, host::AbstractString)::Vector{TCP.SocketEndpoint}
+    return _resolve_host_ips(resolver, "tcp", host)
+end
+
+@inline function _normalize_lookup_host(host::AbstractString)::String
+    normalized = lowercase(String(host))
+    while !isempty(normalized) && last(normalized) == '.'
+        normalized = normalized[1:prevind(normalized, lastindex(normalized))]
+    end
+    return normalized
+end
+
+@inline function _lookup_key(network::AbstractString, host::AbstractString)::Tuple{String, String}
+    return lowercase(String(network)), _normalize_lookup_host(host)
+end
+
+function _resolve_singleflight_host(
+        resolver::SingleflightResolver,
+        network::AbstractString,
+        host::AbstractString,
+    )::Vector{TCP.SocketEndpoint}
+    h = String(host)
+    literal = _literal_host_addr(h)
+    literal === nothing || return TCP.SocketEndpoint[literal]
+    key = _lookup_key(network, h)
+    flight = nothing
+    leader = false
+    lock(resolver.lock)
+    try
+        existing = get(() -> nothing, resolver.inflight, key)
+        if existing === nothing
+            flight = _LookupFlight()
+            resolver.inflight[key] = flight::_LookupFlight
+            @atomic :acquire_release resolver.actual_lookups += 1
+            leader = true
+        else
+            flight = existing::_LookupFlight
+            @atomic :acquire_release resolver.shared_hits += 1
+        end
+    finally
+        unlock(resolver.lock)
+    end
+    if leader
+        result = nothing
+        err = nothing
+        try
+            result = _resolve_host_ips(resolver.parent, network, h)
+        catch ex
+            err = ex::Exception
+        end
+        lock((flight::_LookupFlight).lock)
+        try
+            flight.result = result === nothing ? nothing : copy(result::Vector{TCP.SocketEndpoint})
+            flight.err = err
+            @atomic :release flight.done = true
+            notify(flight.cond; all = true)
+        finally
+            unlock(flight.lock)
+        end
+        lock(resolver.lock)
+        try
+            current = get(() -> nothing, resolver.inflight, key)
+            current === flight && delete!(resolver.inflight, key)
+        finally
+            unlock(resolver.lock)
+        end
+        err === nothing || throw(err::Exception)
+        return result::Vector{TCP.SocketEndpoint}
+    end
+    lock((flight::_LookupFlight).lock)
+    try
+        while !(@atomic :acquire flight.done)
+            wait(flight.cond)
+        end
+        flight.err === nothing || throw(flight.err::Exception)
+        return copy(flight.result::Vector{TCP.SocketEndpoint})
+    finally
+        unlock(flight.lock)
+    end
+end
+
+function _evict_cache_if_needed_locked!(resolver::CachingResolver)
+    length(resolver.entries) <= resolver.max_hosts && return nothing
+    oldest_key = nothing
+    oldest_access = typemax(Int64)
+    for (key, entry) in resolver.entries
+        if entry.last_access_ns < oldest_access
+            oldest_access = entry.last_access_ns
+            oldest_key = key
+        end
+    end
+    oldest_key === nothing || delete!(resolver.entries, oldest_key)
+    return nothing
+end
+
+function _store_cache_entry_locked!(
+        resolver::CachingResolver,
+        key::Tuple{String, String},
+        result::Union{Nothing, Vector{TCP.SocketEndpoint}},
+        err::Union{Nothing, Exception},
+        now_ns::Int64,
+    )
+    expires_ns = now_ns
+    stale_expires_ns = now_ns
+    if err === nothing
+        expires_ns += resolver.ttl_ns
+        stale_expires_ns = expires_ns + resolver.stale_ttl_ns
+    else
+        expires_ns += resolver.negative_ttl_ns
+        stale_expires_ns = expires_ns
+    end
+    resolver.entries[key] = _LookupCacheEntry(
+        result === nothing ? nothing : copy(result::Vector{TCP.SocketEndpoint}),
+        err,
+        expires_ns,
+        stale_expires_ns,
+        now_ns,
+        false,
+    )
+    _evict_cache_if_needed_locked!(resolver)
+    return nothing
+end
+
+function _refresh_cached_host!(
+        resolver::CachingResolver,
+        key::Tuple{String, String},
+        network::String,
+        host::String,
+    )
+    result = nothing
+    err = nothing
+    try
+        result = _resolve_host_ips(resolver.parent, network, host)
+    catch ex
+        err = ex::Exception
+    end
+    now_ns = Int64(time_ns())
+    lock(resolver.lock)
+    try
+        entry = get(() -> nothing, resolver.entries, key)
+        entry === nothing && return nothing
+        if err === nothing
+            _store_cache_entry_locked!(resolver, key, result::Vector{TCP.SocketEndpoint}, nothing, now_ns)
+            return nothing
+        end
+        entry.refreshing = false
+        if err isa AddressError && resolver.negative_ttl_ns > 0
+            _store_cache_entry_locked!(resolver, key, nothing, err, now_ns)
+        end
+    finally
+        unlock(resolver.lock)
+    end
+    return nothing
+end
+
+function _resolve_cached_host(
+        resolver::CachingResolver,
+        network::AbstractString,
+        host::AbstractString,
+    )::Vector{TCP.SocketEndpoint}
+    h = String(host)
+    literal = _literal_host_addr(h)
+    literal === nothing || return TCP.SocketEndpoint[literal]
+    key = _lookup_key(network, h)
+    now_ns = Int64(time_ns())
+    stale_result = nothing
+    refresh_needed = false
+    lock(resolver.lock)
+    try
+        entry = get(() -> nothing, resolver.entries, key)
+        if entry !== nothing
+            entry.last_access_ns = now_ns
+            if now_ns <= entry.expires_ns
+                if entry.err === nothing
+                    @atomic :acquire_release resolver.cache_hits += 1
+                    return copy(entry.result::Vector{TCP.SocketEndpoint})
+                end
+                @atomic :acquire_release resolver.negative_hits += 1
+                throw(entry.err::Exception)
+            end
+            if entry.err === nothing && now_ns <= entry.stale_expires_ns
+                @atomic :acquire_release resolver.stale_hits += 1
+                stale_result = copy(entry.result::Vector{TCP.SocketEndpoint})
+                if !entry.refreshing
+                    entry.refreshing = true
+                    refresh_needed = true
+                end
+            else
+                delete!(resolver.entries, key)
+            end
+        end
+        stale_result === nothing && (@atomic :acquire_release resolver.misses += 1)
+    finally
+        unlock(resolver.lock)
+    end
+    if stale_result !== nothing
+        if refresh_needed
+            errormonitor(Threads.@spawn _refresh_cached_host!(resolver, key, String(network), h))
+        end
+        return stale_result::Vector{TCP.SocketEndpoint}
+    end
+    result = nothing
+    err = nothing
+    try
+        result = _resolve_host_ips(resolver.parent, network, h)
+    catch ex
+        err = ex::Exception
+    end
+    now_ns = Int64(time_ns())
+    lock(resolver.lock)
+    try
+        if err === nothing
+            _store_cache_entry_locked!(resolver, key, result::Vector{TCP.SocketEndpoint}, nothing, now_ns)
+        elseif err isa AddressError && resolver.negative_ttl_ns > 0
+            _store_cache_entry_locked!(resolver, key, nothing, err, now_ns)
+        end
+    finally
+        unlock(resolver.lock)
+    end
+    err === nothing || throw(err::Exception)
+    return result::Vector{TCP.SocketEndpoint}
+end
+
+function _resolve_host_ips(
+        resolver::AbstractResolver,
+        network::AbstractString,
+        host::AbstractString,
+    )::Vector{TCP.SocketEndpoint}
+    if resolver isa SingleflightResolver
+        return _resolve_singleflight_host(resolver::SingleflightResolver, network, host)
+    end
+    if resolver isa CachingResolver
+        return _resolve_cached_host(resolver::CachingResolver, network, host)
+    end
     if resolver isa SystemResolver
         return _resolve_system_host(host)
     end
-    return _resolve_static_host(resolver::StaticResolver, host)
+    if resolver isa StaticResolver
+        return _resolve_static_host(resolver::StaticResolver, network, host)
+    end
+    resolved = resolve_tcp_addrs(
+        resolver,
+        network,
+        join_host_port(host, 0);
+        op = :resolve,
+        policy = ResolverPolicy(),
+    )
+    ips = TCP.SocketEndpoint[]
+    for addr in resolved
+        if addr isa TCP.SocketAddrV4
+            v4 = addr::TCP.SocketAddrV4
+            push!(ips, TCP.SocketAddrV4(v4.ip, 0))
+        else
+            v6 = addr::TCP.SocketAddrV6
+            push!(ips, TCP.SocketAddrV6(v6.ip, 0; scope_id = Int(v6.scope_id)))
+        end
+    end
+    return ips
 end
+
+lookup_port(resolver::SingleflightResolver, network::AbstractString, service::AbstractString)::Int =
+    lookup_port((resolver::SingleflightResolver).parent, network, service)
+
+lookup_port(resolver::CachingResolver, network::AbstractString, service::AbstractString)::Int =
+    lookup_port((resolver::CachingResolver).parent, network, service)
 
 @inline function _wildcard_addrs(kind::Symbol, op::Symbol)::Vector{TCP.SocketEndpoint}
     if kind == :tcp && op == :listen
@@ -812,7 +1185,7 @@ function resolve_tcp_addrs(
     ips = if isempty(host)
         _wildcard_addrs(kind, op)
     else
-        _resolve_host_ips(resolver, host)
+        _resolve_host_ips(resolver, network, host)
     end
     filtered = _apply_policy_and_network(ips, kind, policy)
     isempty(filtered) && _addr_error("no suitable address", host)
@@ -894,12 +1267,13 @@ function HostResolver(;
         resolver::AbstractResolver = DEFAULT_RESOLVER,
         policy::ResolverPolicy = ResolverPolicy(),
     )
-    return HostResolver{typeof(resolver)}(
+    wrapped = resolver isa SingleflightResolver ? resolver : SingleflightResolver(resolver)
+    return HostResolver{typeof(wrapped)}(
         Int64(timeout_ns),
         Int64(deadline_ns),
         local_addr,
         Int64(fallback_delay_ns),
-        resolver,
+        wrapped,
         policy,
     )
 end

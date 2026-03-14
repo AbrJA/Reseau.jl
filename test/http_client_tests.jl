@@ -525,10 +525,15 @@ end
         @test String(resp.body) == "ok"
         @test resp.url == "$(base_url)/final"
         @test resp.redirect_count == 1
+        @test resp.request !== nothing
+        @test resp.request.target == "/final"
         @test resp.previous !== nothing
         @test resp.previous.status == 302
         @test resp.previous.url == "$(base_url)/start"
         @test resp.previous.redirect_count == 0
+        @test resp.previous.request !== nothing
+        @test resp.previous.request.target == "/start"
+        @test resp.request !== resp.previous.request
 
         err = try
             HT.get("$(base_url)/limit-start"; redirect_limit = 1)
@@ -875,6 +880,34 @@ end
             @test status_err.response.url == "$(base_url)/missing"
         end
 
+        parsed = HT._parse_http_url("http://alice:secret@$(address)/lazy/path?x=1#frag"; query = Dict("y" => 2))
+        @test !parsed.secure
+        @test parsed.address == "$(address)"
+        @test parsed.address === parsed.address
+        @test parsed.target == "/lazy/path?x=1&y=2"
+        @test parsed.target === parsed.target
+        @test parsed.server_name == "127.0.0.1"
+        @test parsed.server_name === parsed.server_name
+        @test parsed.url == "http://$(address)/lazy/path?x=1&y=2"
+        @test parsed.url === parsed.url
+        @test parsed.authorization == "Basic YWxpY2U6c2VjcmV0"
+        @test parsed.authorization === parsed.authorization
+
+        parsed_query = HT._parse_http_url("https://example.com?x=1"; query = Dict("y" => 2))
+        @test parsed_query.secure
+        @test parsed_query.address == "example.com:443"
+        @test parsed_query.target == "/?x=1&y=2"
+        @test parsed_query.server_name == "example.com"
+        @test parsed_query.url == "https://example.com:443/?x=1&y=2"
+        @test parsed_query.authorization === nothing
+
+        parsed_ipv6 = HT._parse_http_url("https://[2001:db8::1]/ipv6")
+        @test parsed_ipv6.address == "[2001:db8::1]:443"
+        @test parsed_ipv6.target == "/ipv6"
+        @test parsed_ipv6.server_name == "2001:db8::1"
+        @test parsed_ipv6.url == "https://[2001:db8::1]:443/ipv6"
+        @test parsed_ipv6.authorization === nothing
+
         _wait_task_client!(server_task)
         @test "/hello" in seen_targets
         @test "/echo" in seen_targets
@@ -897,7 +930,7 @@ end
     address = ND.join_host_port("127.0.0.1", Int(laddr.port))
     base_url = "http://$(address)"
     server_task = errormonitor(Threads.@spawn begin
-        for _ in 1:6
+        for _ in 1:8
             conn = NC.accept!(listener)
             try
                 req = HT.read_request(HT._ConnReader(conn))
@@ -919,6 +952,16 @@ end
                     _send_response_bytes_client!(conn, req; body_bytes = payload, headers = headers, close_conn = true)
                 elseif req.target == "/gzip-stream"
                     payload = _gzip_bytes_client("gzip-stream")
+                    headers = HT.Headers()
+                    HT.setheader(headers, "Content-Encoding", "gzip")
+                    _send_response_bytes_client!(conn, req; body_bytes = payload, headers = headers, close_conn = true)
+                elseif req.target == "/gzip-buffer"
+                    payload = _gzip_bytes_client("gzip-buffer")
+                    headers = HT.Headers()
+                    HT.setheader(headers, "Content-Encoding", "gzip")
+                    _send_response_bytes_client!(conn, req; body_bytes = payload, headers = headers, close_conn = true)
+                elseif req.target == "/gzip-too-small"
+                    payload = _gzip_bytes_client("overflow")
                     headers = HT.Headers()
                     HT.setheader(headers, "Content-Encoding", "gzip")
                     _send_response_bytes_client!(conn, req; body_bytes = payload, headers = headers, close_conn = true)
@@ -971,6 +1014,23 @@ end
         @test resp_gzip_stream.status == 200
         @test resp_gzip_stream.body === nothing
         @test String(take!(streamed_gzip)) == "gzip-stream"
+
+        gzip_buffer = Vector{UInt8}(undef, 32)
+        resp_gzip_buffer = HT.get("$(base_url)/gzip-buffer"; response_stream = gzip_buffer, decompress = true)
+        @test resp_gzip_buffer.status == 200
+        @test resp_gzip_buffer.body === gzip_buffer
+        @test String(resp_gzip_buffer.body) == "gzip-buffer"
+
+        gzip_small_err = try
+            HT.get("$(base_url)/gzip-too-small"; response_stream = Vector{UInt8}(undef, 2), decompress = true)
+            nothing
+        catch err
+            err
+        end
+        @test gzip_small_err isa ArgumentError
+        if gzip_small_err isa ArgumentError
+            @test occursin("Unable to grow response stream IOBuffer", sprint(showerror, gzip_small_err))
+        end
 
         _wait_task_client!(server_task)
     finally

@@ -96,6 +96,24 @@ mutable struct ClientConn
     last_used_ns::Int64
 end
 
+const _CONN_WAITER_WAITING = UInt8(0)
+const _CONN_WAITER_CONN = UInt8(1)
+const _CONN_WAITER_DIAL = UInt8(2)
+const _CONN_WAITER_ERROR = UInt8(3)
+const _CONN_WAITER_CANCELED = UInt8(4)
+
+mutable struct _ConnWaiter
+    key::String
+    signal::Channel{Nothing}
+    conn::Union{Nothing, ClientConn}
+    err::Union{Nothing, Exception}
+    @atomic state::UInt8
+end
+
+function _ConnWaiter(key::String)
+    return _ConnWaiter(key, Channel{Nothing}(1), nothing, nothing, _CONN_WAITER_WAITING)
+end
+
 """
     Transport(; ...)
 
@@ -104,6 +122,11 @@ Connection-pooling transport for HTTP/1 requests.
 This is the closest analogue to Go's `http.Transport` in the current codebase.
 It owns dial/TLS policy and decides when an idle connection can be reused versus
 closed.
+
+`max_conns_per_host = 0` leaves per-host concurrency unlimited. Positive values
+bound the total live HTTP/1 connections (idle, in-flight, and dialing) for one
+pool key and cause additional acquires to wait for direct handoff or a freed
+dial slot.
 """
 mutable struct Transport
     host_resolver::HostResolvers.HostResolver
@@ -112,9 +135,12 @@ mutable struct Transport
     retry_bucket::Union{Nothing, RetryBucket}
     max_idle_per_host::Int
     max_idle_total::Int
+    max_conns_per_host::Int
     idle_timeout_ns::Int64
     lock::ReentrantLock
     idle::Dict{String, Vector{ClientConn}}
+    waiters::Dict{String, Vector{_ConnWaiter}}
+    conns_per_host::Dict{String, Int}
     @atomic idle_total::Int
     @atomic closed::Bool
 end
@@ -146,10 +172,12 @@ function Transport(;
         retry_bucket::Union{Nothing, RetryBucket} = RetryBucket(),
         max_idle_per_host::Integer = 2,
         max_idle_total::Integer = 64,
+        max_conns_per_host::Integer = 0,
         idle_timeout_ns::Integer = Int64(90_000_000_000),
     )
     max_idle_per_host > 0 || throw(ArgumentError("max_idle_per_host must be > 0"))
     max_idle_total > 0 || throw(ArgumentError("max_idle_total must be > 0"))
+    max_conns_per_host >= 0 || throw(ArgumentError("max_conns_per_host must be >= 0"))
     idle_timeout_ns >= 0 || throw(ArgumentError("idle_timeout_ns must be >= 0"))
     return Transport(
         host_resolver,
@@ -158,9 +186,12 @@ function Transport(;
         retry_bucket,
         Int(max_idle_per_host),
         Int(max_idle_total),
+        Int(max_conns_per_host),
         Int64(idle_timeout_ns),
         ReentrantLock(),
         Dict{String, Vector{ClientConn}}(),
+        Dict{String, Vector{_ConnWaiter}}(),
+        Dict{String, Int}(),
         0,
         false,
     )
@@ -183,9 +214,9 @@ function _conn_stream(conn::ClientConn)
     return conn.tcp::TCP.Conn
 end
 
-function _close_conn!(conn::ClientConn)
+function _close_conn!(conn::ClientConn)::Bool
     if _conn_closed(conn)
-        return nothing
+        return false
     end
     @atomic :release conn.closed = true
     if conn.secure
@@ -203,6 +234,167 @@ function _close_conn!(conn::ClientConn)
             end
         end
     end
+    return true
+end
+
+@inline function _notify_waiter!(waiter::_ConnWaiter)
+    isready(waiter.signal) || put!(waiter.signal, nothing)
+    return nothing
+end
+
+@inline function _waiter_waiting(waiter::_ConnWaiter)::Bool
+    return (@atomic :acquire waiter.state) == _CONN_WAITER_WAITING
+end
+
+function _enqueue_waiter_locked!(transport::Transport, waiter::_ConnWaiter)
+    queue = get(() -> _ConnWaiter[], transport.waiters, waiter.key)
+    push!(queue, waiter)
+    transport.waiters[waiter.key] = queue
+    return waiter
+end
+
+function _remove_waiter_locked!(transport::Transport, key::String, waiter::_ConnWaiter)
+    queue = get(() -> nothing, transport.waiters, key)
+    queue === nothing && return nothing
+    idx = findfirst(isequal(waiter), queue::Vector{_ConnWaiter})
+    idx === nothing || deleteat!(queue::Vector{_ConnWaiter}, idx)
+    isempty(queue::Vector{_ConnWaiter}) && delete!(transport.waiters, key)
+    return nothing
+end
+
+function _next_waiter_locked!(transport::Transport, key::String)::Union{Nothing, _ConnWaiter}
+    queue = get(() -> nothing, transport.waiters, key)
+    queue === nothing && return nothing
+    while !isempty(queue::Vector{_ConnWaiter})
+        waiter = popfirst!(queue::Vector{_ConnWaiter})
+        if _waiter_waiting(waiter)
+            isempty(queue::Vector{_ConnWaiter}) && delete!(transport.waiters, key)
+            return waiter
+        end
+    end
+    delete!(transport.waiters, key)
+    return nothing
+end
+
+@inline function _conn_slots_locked(transport::Transport, key::String)::Int
+    return get(() -> 0, transport.conns_per_host, key)
+end
+
+function _reserve_conn_slot_locked!(transport::Transport, key::String)::Bool
+    current = _conn_slots_locked(transport, key)
+    max_per_host = transport.max_conns_per_host
+    if max_per_host != 0 && current >= max_per_host
+        return false
+    end
+    transport.conns_per_host[key] = current + 1
+    return true
+end
+
+function _decrement_conn_slot_locked!(transport::Transport, key::String)
+    current = _conn_slots_locked(transport, key)
+    current <= 1 ? delete!(transport.conns_per_host, key) : (transport.conns_per_host[key] = current - 1)
+    return nothing
+end
+
+function _promote_waiter_to_dial_locked!(transport::Transport, key::String)::Union{Nothing, _ConnWaiter}
+    transport.max_conns_per_host == 0 && return nothing
+    _reserve_conn_slot_locked!(transport, key) || return nothing
+    waiter = _next_waiter_locked!(transport, key)
+    if waiter === nothing
+        _decrement_conn_slot_locked!(transport, key)
+        return nothing
+    end
+    waiter.conn = nothing
+    waiter.err = nothing
+    @atomic :release waiter.state = _CONN_WAITER_DIAL
+    return waiter
+end
+
+function _release_conn_slot_locked!(transport::Transport, key::String)::Union{Nothing, _ConnWaiter}
+    _decrement_conn_slot_locked!(transport, key)
+    _transport_closed(transport) && return nothing
+    return _promote_waiter_to_dial_locked!(transport, key)
+end
+
+function _close_owned_conn!(transport::Transport, conn::ClientConn)
+    _close_conn!(conn) || return nothing
+    waiter = nothing
+    lock(transport.lock)
+    try
+        waiter = _release_conn_slot_locked!(transport, conn.key)
+    finally
+        unlock(transport.lock)
+    end
+    waiter === nothing || _notify_waiter!(waiter)
+    return nothing
+end
+
+function _close_owned_conns!(transport::Transport, conns::Vector{ClientConn})
+    for conn in conns
+        _close_owned_conn!(transport, conn)
+    end
+    return nothing
+end
+
+function _deliver_waiter_conn_locked!(waiter::_ConnWaiter, conn::ClientConn)::Bool
+    _waiter_waiting(waiter) || return false
+    waiter.conn = conn
+    waiter.err = nothing
+    @atomic :release waiter.state = _CONN_WAITER_CONN
+    return true
+end
+
+function _deliver_waiter_error_locked!(waiter::_ConnWaiter, err::Exception)::Bool
+    _waiter_waiting(waiter) || return false
+    waiter.conn = nothing
+    waiter.err = err
+    @atomic :release waiter.state = _CONN_WAITER_ERROR
+    return true
+end
+
+function _wait_for_conn!(transport::Transport, waiter::_ConnWaiter, deadline_ns::Int64)
+    while true
+        state = @atomic :acquire waiter.state
+        if state == _CONN_WAITER_CONN
+            return waiter.conn::ClientConn
+        elseif state == _CONN_WAITER_DIAL
+            return :dial
+        elseif state == _CONN_WAITER_ERROR
+            throw(waiter.err::Exception)
+        elseif state == _CONN_WAITER_CANCELED
+            throw(IOPoll.DeadlineExceededError())
+        end
+        if deadline_ns == 0
+            take!(waiter.signal)
+            continue
+        end
+        now_ns = Int64(time_ns())
+        if now_ns >= deadline_ns
+            lock(transport.lock)
+            try
+                if _waiter_waiting(waiter)
+                    _remove_waiter_locked!(transport, waiter.key, waiter)
+                    @atomic :release waiter.state = _CONN_WAITER_CANCELED
+                    throw(IOPoll.DeadlineExceededError())
+                end
+            finally
+                unlock(transport.lock)
+            end
+            continue
+        end
+        timeout_s = min((deadline_ns - now_ns) / 1.0e9, 0.05)
+        timedwait(() -> isready(waiter.signal), timeout_s; pollint = 0.001)
+        isready(waiter.signal) && take!(waiter.signal)
+    end
+end
+
+function _prepare_conn_for_reuse!(conn::ClientConn)
+    if conn.secure
+        conn.tls === nothing || TLS.set_deadline!(conn.tls::TLS.Conn, Int64(0))
+    else
+        conn.tcp === nothing || TCP.set_deadline!(conn.tcp::TCP.Conn, Int64(0))
+    end
+    conn.last_used_ns = time_ns()
     return nothing
 end
 
@@ -236,9 +428,29 @@ function _effective_tls_config(transport::Transport, address::String, server_nam
 end
 
 function _write_request_bytes!(stream, request_io::IOBuffer)
-    request_bytes = request_io.size
-    n = write(stream, request_io.data, request_bytes)
+    data = take!(request_io)
+    request_bytes = length(data)
+    request_bytes == 0 && return nothing
+    n = write(stream, data)
     n == request_bytes || throw(ProtocolError("transport short write"))
+    return nothing
+end
+
+function _write_request_streaming!(
+        request_io::IOBuffer,
+        stream,
+        request::Request;
+        wire_target::Union{Nothing, AbstractString} = nothing,
+        proxy_authorization::Union{Nothing, AbstractString} = nothing,
+    )
+    if request.content_length >= 0 && request.body isa BytesBody && !headercontains(request.headers, "Transfer-Encoding", "chunked")
+        _write_request_head!(request_io, request; wire_target = wire_target, proxy_authorization = proxy_authorization)
+        _write_request_bytes!(stream, request_io)
+        _write_exact_bytes_body!(stream, request.body::BytesBody, request.content_length)
+        return nothing
+    end
+    write_request!(request_io, request; wire_target = wire_target, proxy_authorization = proxy_authorization)
+    _write_request_bytes!(stream, request_io)
     return nothing
 end
 
@@ -294,15 +506,16 @@ function _new_conn!(
     return ClientConn(plan.pool_key, plan.first_hop_address, false, tcp, nothing, _ConnReader(tcp), IOBuffer(), false, false, time_ns())
 end
 
-function _evict_expired_idle_locked!(transport::Transport, key::String, now_ns::Int64)
+function _evict_expired_idle_locked!(transport::Transport, key::String, now_ns::Int64)::Vector{ClientConn}
     idle_list = get(() -> nothing, transport.idle, key)
-    idle_list === nothing && return nothing
+    idle_list === nothing && return ClientConn[]
     kept = ClientConn[]
+    stale = ClientConn[]
     for conn in idle_list::Vector{ClientConn}
         expired = transport.idle_timeout_ns > 0 && (now_ns - conn.last_used_ns) > transport.idle_timeout_ns
         if _conn_closed(conn) || expired
-            _close_conn!(conn)
             @atomic :acquire_release transport.idle_total -= 1
+            push!(stale, conn)
             continue
         end
         push!(kept, conn)
@@ -312,7 +525,7 @@ function _evict_expired_idle_locked!(transport::Transport, key::String, now_ns::
     else
         transport.idle[key] = kept
     end
-    return nothing
+    return stale
 end
 
 function _acquire_conn!(
@@ -324,55 +537,118 @@ function _acquire_conn!(
         deadline_ns::Int64 = Int64(0),
     )::ClientConn
     _transport_closed(transport) && throw(ProtocolError("transport is closed"))
-    lock(transport.lock)
-    try
-        now_ns = Int64(time_ns())
-        _evict_expired_idle_locked!(transport, plan.pool_key, now_ns)
-        idle_list = get(() -> nothing, transport.idle, plan.pool_key)
-        if idle_list !== nothing && !isempty(idle_list::Vector{ClientConn})
-            conn = pop!(idle_list::Vector{ClientConn})
-            @atomic :acquire_release transport.idle_total -= 1
-            isempty(idle_list::Vector{ClientConn}) && delete!(transport.idle, plan.pool_key)
-            if !_conn_closed(conn)
-                conn.reused = true
-                return conn
+    waiter = nothing
+    while true
+        stale = ClientConn[]
+        conn = nothing
+        should_dial = false
+        lock(transport.lock)
+        try
+            _transport_closed(transport) && throw(ProtocolError("transport is closed"))
+            now_ns = Int64(time_ns())
+            append!(stale, _evict_expired_idle_locked!(transport, plan.pool_key, now_ns))
+            idle_list = get(() -> nothing, transport.idle, plan.pool_key)
+            while idle_list !== nothing && !isempty(idle_list::Vector{ClientConn})
+                conn = pop!(idle_list::Vector{ClientConn})
+                @atomic :acquire_release transport.idle_total -= 1
+                isempty(idle_list::Vector{ClientConn}) && delete!(transport.idle, plan.pool_key)
+                if !_conn_closed(conn::ClientConn)
+                    (conn::ClientConn).reused = true
+                    break
+                end
+                push!(stale, conn::ClientConn)
+                conn = nothing
+                idle_list = get(() -> nothing, transport.idle, plan.pool_key)
             end
-            _close_conn!(conn)
+            if conn === nothing && isempty(stale)
+                if _reserve_conn_slot_locked!(transport, plan.pool_key)
+                    should_dial = true
+                else
+                    waiter = _ConnWaiter(plan.pool_key)
+                    _enqueue_waiter_locked!(transport, waiter)
+                end
+            end
+        finally
+            unlock(transport.lock)
         end
-    finally
-        unlock(transport.lock)
+        isempty(stale) || (_close_owned_conns!(transport, stale); continue)
+        if conn !== nothing
+            return conn::ClientConn
+        end
+        if should_dial
+            try
+                return _new_conn!(transport, plan, address; secure = secure, server_name = server_name, deadline_ns = deadline_ns)
+            catch err
+                waiter_to_notify = nothing
+                lock(transport.lock)
+                try
+                    waiter_to_notify = _release_conn_slot_locked!(transport, plan.pool_key)
+                finally
+                    unlock(transport.lock)
+                end
+                waiter_to_notify === nothing || _notify_waiter!(waiter_to_notify)
+                rethrow(err)
+            end
+        end
+        result = _wait_for_conn!(transport, waiter::_ConnWaiter, deadline_ns)
+        if result === :dial
+            try
+                return _new_conn!(transport, plan, address; secure = secure, server_name = server_name, deadline_ns = deadline_ns)
+            catch err
+                waiter_to_notify = nothing
+                lock(transport.lock)
+                try
+                    waiter_to_notify = _release_conn_slot_locked!(transport, plan.pool_key)
+                finally
+                    unlock(transport.lock)
+                end
+                waiter_to_notify === nothing || _notify_waiter!(waiter_to_notify)
+                rethrow(err)
+            end
+        end
+        conn = result::ClientConn
+        conn.reused = true
+        return conn
     end
-    return _new_conn!(transport, plan, address; secure = secure, server_name = server_name, deadline_ns = deadline_ns)
 end
 
 function _put_idle_conn!(transport::Transport, conn::ClientConn)
     if _transport_closed(transport) || _conn_closed(conn)
-        _close_conn!(conn)
+        _close_owned_conn!(transport, conn)
         return nothing
     end
+    try
+        _prepare_conn_for_reuse!(conn)
+    catch
+        _close_owned_conn!(transport, conn)
+        return nothing
+    end
+    waiter_to_notify = nothing
+    should_close = false
     lock(transport.lock)
     try
         if _transport_closed(transport)
-            _close_conn!(conn)
-            return nothing
-        end
-        idle_list = get(() -> ClientConn[], transport.idle, conn.key)
-        if length(idle_list) >= transport.max_idle_per_host || (@atomic :acquire transport.idle_total) >= transport.max_idle_total
-            _close_conn!(conn)
-            return nothing
-        end
-        if conn.secure
-            conn.tls === nothing || TLS.set_deadline!(conn.tls::TLS.Conn, Int64(0))
+            should_close = true
         else
-            conn.tcp === nothing || TCP.set_deadline!(conn.tcp::TCP.Conn, Int64(0))
+            waiter = _next_waiter_locked!(transport, conn.key)
+            if waiter !== nothing && _deliver_waiter_conn_locked!(waiter, conn)
+                waiter_to_notify = waiter
+            else
+                idle_list = get(() -> ClientConn[], transport.idle, conn.key)
+                if length(idle_list) >= transport.max_idle_per_host || (@atomic :acquire transport.idle_total) >= transport.max_idle_total
+                    should_close = true
+                else
+                    push!(idle_list, conn)
+                    transport.idle[conn.key] = idle_list
+                    @atomic :acquire_release transport.idle_total += 1
+                end
+            end
         end
-        conn.last_used_ns = time_ns()
-        push!(idle_list, conn)
-        transport.idle[conn.key] = idle_list
-        @atomic :acquire_release transport.idle_total += 1
     finally
         unlock(transport.lock)
     end
+    waiter_to_notify === nothing || (_notify_waiter!(waiter_to_notify); return nothing)
+    should_close && _close_owned_conn!(transport, conn)
     return nothing
 end
 
@@ -383,11 +659,12 @@ Close and discard all currently idle pooled connections. Active in-flight
 requests are unaffected. Returns `nothing`.
 """
 function close_idle_connections!(transport::Transport)
+    to_close = ClientConn[]
     lock(transport.lock)
     try
         for (_, idle_list) in transport.idle
             for conn in idle_list
-                _close_conn!(conn)
+                push!(to_close, conn)
             end
         end
         empty!(transport.idle)
@@ -395,6 +672,7 @@ function close_idle_connections!(transport::Transport)
     finally
         unlock(transport.lock)
     end
+    _close_owned_conns!(transport, to_close)
     return nothing
 end
 
@@ -406,8 +684,29 @@ requests are allowed to finish on the connections they already hold.
 """
 function Base.close(transport::Transport)
     _transport_closed(transport) && return nothing
-    @atomic :release transport.closed = true
-    close_idle_connections!(transport)
+    to_close = ClientConn[]
+    waiters_to_notify = _ConnWaiter[]
+    err = ProtocolError("transport is closed")
+    lock(transport.lock)
+    try
+        _transport_closed(transport) && return nothing
+        @atomic :release transport.closed = true
+        for (_, idle_list) in transport.idle
+            append!(to_close, idle_list)
+        end
+        empty!(transport.idle)
+        @atomic :release transport.idle_total = 0
+        for (_, queue) in transport.waiters
+            for waiter in queue
+                _deliver_waiter_error_locked!(waiter, err) && push!(waiters_to_notify, waiter)
+            end
+        end
+        empty!(transport.waiters)
+    finally
+        unlock(transport.lock)
+    end
+    _close_owned_conns!(transport, to_close)
+    foreach(_notify_waiter!, waiters_to_notify)
     return nothing
 end
 
@@ -561,7 +860,7 @@ function _release_managed!(body::ManagedBody)
     if body.reusable
         _put_idle_conn!(body.transport, body.conn)
     else
-        _close_conn!(body.conn)
+        _close_owned_conn!(body.transport, body.conn)
     end
     return nothing
 end
@@ -589,7 +888,6 @@ function body_read!(body::ManagedBody, dst::Vector{UInt8})::Int
         return n
     catch
         body.reusable = false
-        _close_conn!(body.conn)
         _release_managed!(body)
         rethrow()
     end
@@ -633,18 +931,17 @@ function _roundtrip_incoming!(
         try
             _apply_conn_deadline!(conn, request_deadline)
             request_io = _reset_request_buffer!(conn)
+            stream = _conn_stream(conn)
             try
                 wire_target = plan.mode == _ProxyPlanMode.HTTP_FORWARD ? _request_url(false, String(address), current_request.target) : nothing
                 proxy_auth = plan.mode == _ProxyPlanMode.HTTP_FORWARD && plan.proxy !== nothing ? (plan.proxy::_ProxyTarget).authorization : nothing
-                write_request!(request_io, current_request; wire_target = wire_target, proxy_authorization = proxy_auth)
+                _write_request_streaming!(request_io, stream, current_request; wire_target = wire_target, proxy_authorization = proxy_auth)
             finally
                 try
                     body_close!(current_request.body)
                 catch
                 end
             end
-            stream = _conn_stream(conn)
-            _write_request_bytes!(stream, request_io)
             reader = conn.reader
             raw_response = _read_incoming_response(reader, current_request)
             # HTTP/1 informational responses are consumed internally so callers
@@ -662,7 +959,7 @@ function _roundtrip_incoming!(
                 if reusable
                     _put_idle_conn!(transport, conn)
                 else
-                    _close_conn!(conn)
+                    _close_owned_conn!(transport, conn)
                 end
                 return raw_response
             end
@@ -672,7 +969,7 @@ function _roundtrip_incoming!(
                 managed,
             )
         catch err
-            _close_conn!(conn)
+            _close_owned_conn!(transport, conn)
             if attempt == 1 && was_reused && retry_template !== nothing && _retryable_reused_conn_error(err)
                 current_request = _copy_request(retry_template::Request)
                 attempt = 2
@@ -1020,34 +1317,34 @@ function _clone_body(body::AbstractBody)::AbstractBody
 end
 
 function _copy_request(request::Request)
-    return Request(
+    return _request_nocopy(
         request.method,
-        request.target;
-        headers = request.headers,
-        trailers = request.trailers,
-        body = _clone_body(request.body),
-        host = request.host,
-        content_length = request.content_length,
-        proto_major = request.proto_major,
-        proto_minor = request.proto_minor,
-        close = request.close,
-        context = request.context,
+        request.target,
+        copy(request.headers),
+        copy(request.trailers),
+        _clone_body(request.body),
+        request.host,
+        request.content_length,
+        request.proto_major,
+        request.proto_minor,
+        request.close,
+        request.context,
     )
 end
 
 function _copy_request_shallow_body(request::Request)
-    return Request(
+    return _request_nocopy(
         request.method,
-        request.target;
-        headers = request.headers,
-        trailers = request.trailers,
-        body = request.body,
-        host = request.host,
-        content_length = request.content_length,
-        proto_major = request.proto_major,
-        proto_minor = request.proto_minor,
-        close = request.close,
-        context = request.context,
+        request.target,
+        copy(request.headers),
+        copy(request.trailers),
+        request.body,
+        request.host,
+        request.content_length,
+        request.proto_major,
+        request.proto_minor,
+        request.close,
+        request.context,
     )
 end
 
@@ -1295,17 +1592,18 @@ function _prepare_request_for_redirect(request::Request, status_code::Int, new_t
         end
         copied
     else
-        Request(
+        _request_nocopy(
             method,
-            new_target;
-            headers = policy.forward_headers ? request.headers : Headers(),
-            host = request.host,
-            body = EmptyBody(),
-            content_length = 0,
-            proto_major = request.proto_major,
-            proto_minor = request.proto_minor,
-            close = request.close,
-            context = request.context,
+            new_target,
+            policy.forward_headers ? copy(request.headers) : Headers(),
+            Headers(),
+            EmptyBody(),
+            request.host,
+            Int64(0),
+            request.proto_major,
+            request.proto_minor,
+            request.close,
+            request.context,
         )
     end
     removeheader(redirected.headers, "Host")
@@ -1355,7 +1653,7 @@ function _do_incoming!(
     current_secure = secure
     explicit_server_name = server_name !== nothing
     current_server_name = explicit_server_name ? String(server_name::AbstractString) : _host_for_sni(current_address)
-    current_request = _copy_request_for_send(request; allow_nonreplayable = true)
+    current_request = _copy_request_shallow_body(request)
     controller = retry_controller
     previous_response = nothing
     retry_attempt = 1
@@ -1587,13 +1885,186 @@ function Base.showerror(io::IO, err::TooManyRedirectsError)
     return nothing
 end
 
-struct _URLParts
+struct _TextRange
+    first::Int
+    last::Int
+end
+
+const _EMPTY_TEXT_RANGE = _TextRange(0, 0)
+
+@inline function _text_range(lo::Int, hi::Int)::_TextRange
+    return lo <= hi ? _TextRange(lo, hi) : _EMPTY_TEXT_RANGE
+end
+
+@inline function _text_range_empty(r::_TextRange)::Bool
+    return r.first == 0
+end
+
+@inline function _text_range_string(source::String, r::_TextRange)::String
+    _text_range_empty(r) && return ""
+    return String(SubString(source, r.first, r.last))
+end
+
+@inline function _find_url_byte(
+        bytes::Base.CodeUnits{UInt8, String},
+        lo::Int,
+        hi::Int,
+        byte::UInt8,
+    )::Union{Nothing, Int}
+    lo > hi && return nothing
+    @inbounds for i in lo:hi
+        bytes[i] == byte && return i
+    end
+    return nothing
+end
+
+@inline function _find_last_url_byte(
+        bytes::Base.CodeUnits{UInt8, String},
+        lo::Int,
+        hi::Int,
+        byte::UInt8,
+    )::Union{Nothing, Int}
+    lo > hi && return nothing
+    @inbounds for i in hi:-1:lo
+        bytes[i] == byte && return i
+    end
+    return nothing
+end
+
+@inline function _find_first_url_sep(
+        bytes::Base.CodeUnits{UInt8, String},
+        lo::Int,
+        hi::Int,
+    )::Union{Nothing, Int}
+    lo > hi && return nothing
+    @inbounds for i in lo:hi
+        b = bytes[i]
+        (b == UInt8('/') || b == UInt8('?')) && return i
+    end
+    return nothing
+end
+
+@inline function _ascii_equal_fold_literal(
+        bytes::Base.CodeUnits{UInt8, String},
+        lo::Int,
+        hi::Int,
+        literal::String,
+    )::Bool
+    n = hi >= lo ? (hi - lo + 1) : 0
+    n == ncodeunits(literal) || return false
+    @inbounds for j in 1:n
+        _to_ascii_lower(bytes[lo + j - 1]) == _to_ascii_lower(codeunit(literal, j)) || return false
+    end
+    return true
+end
+
+mutable struct _URLParts
+    source::String
     secure::Bool
-    address::String
-    target::String
-    server_name::String
-    url::String
-    authorization::Union{Nothing, String}
+    default_port::UInt16
+    authority_range::_TextRange
+    host_range::_TextRange
+    userinfo_range::_TextRange
+    target_range::_TextRange
+    query_suffix::String
+    has_explicit_port::Bool
+    target_starts_with_query::Bool
+    has_userinfo::Bool
+    address_cache::String
+    target_cache::String
+    server_name_cache::String
+    url_cache::String
+    authorization_cache::String
+end
+
+function _urlparts_address!(parts::_URLParts)::String
+    cached = getfield(parts, :address_cache)
+    isempty(cached) || return cached
+    source = getfield(parts, :source)
+    address = if getfield(parts, :has_explicit_port)
+        _text_range_string(source, getfield(parts, :authority_range))
+    else
+        host = _text_range_string(source, getfield(parts, :host_range))
+        HostResolvers.join_host_port(host, Int(getfield(parts, :default_port)))
+    end
+    setfield!(parts, :address_cache, address)
+    return address
+end
+
+function _urlparts_target!(parts::_URLParts)::String
+    cached = getfield(parts, :target_cache)
+    isempty(cached) || return cached
+    source = getfield(parts, :source)
+    query_suffix = getfield(parts, :query_suffix)
+    target_range = getfield(parts, :target_range)
+    target = if _text_range_empty(target_range)
+        isempty(query_suffix) ? "/" : string("/?", query_suffix)
+    else
+        base = if getfield(parts, :target_starts_with_query)
+            string("/", SubString(source, target_range.first, target_range.last))
+        else
+            String(SubString(source, target_range.first, target_range.last))
+        end
+        isempty(query_suffix) ? base : _append_query(base, query_suffix)
+    end
+    setfield!(parts, :target_cache, target)
+    return target
+end
+
+function _urlparts_server_name!(parts::_URLParts)::String
+    cached = getfield(parts, :server_name_cache)
+    isempty(cached) || return cached
+    source = getfield(parts, :source)
+    server_name = if getfield(parts, :has_explicit_port)
+        host, _ = HostResolvers.split_host_port(_urlparts_address!(parts))
+        host
+    else
+        _text_range_string(source, getfield(parts, :host_range))
+    end
+    setfield!(parts, :server_name_cache, server_name)
+    return server_name
+end
+
+function _urlparts_url!(parts::_URLParts)::String
+    cached = getfield(parts, :url_cache)
+    isempty(cached) || return cached
+    url = _request_url(getfield(parts, :secure), _urlparts_address!(parts), _urlparts_target!(parts))
+    setfield!(parts, :url_cache, url)
+    return url
+end
+
+function _urlparts_authorization!(parts::_URLParts)::Union{Nothing, String}
+    getfield(parts, :has_userinfo) || return nothing
+    cached = getfield(parts, :authorization_cache)
+    isempty(cached) || return cached
+    userinfo = _text_range_string(getfield(parts, :source), getfield(parts, :userinfo_range))
+    parts_split = split(userinfo, ':'; limit = 2)
+    username = parts_split[1]
+    password = length(parts_split) == 2 ? parts_split[2] : ""
+    authorization = "Basic " * base64encode(string(username, ":", password))
+    setfield!(parts, :authorization_cache, authorization)
+    return authorization
+end
+
+function Base.getproperty(parts::_URLParts, sym::Symbol)
+    if sym === :secure
+        return getfield(parts, :secure)
+    elseif sym === :address
+        return _urlparts_address!(parts)
+    elseif sym === :target
+        return _urlparts_target!(parts)
+    elseif sym === :server_name
+        return _urlparts_server_name!(parts)
+    elseif sym === :url
+        return _urlparts_url!(parts)
+    elseif sym === :authorization
+        return _urlparts_authorization!(parts)
+    end
+    return getfield(parts, sym)
+end
+
+function Base.propertynames(::_URLParts, private::Bool = false)
+    return private ? fieldnames(_URLParts) : (:secure, :address, :target, :server_name, :url, :authorization)
 end
 
 @inline function _request_url(secure::Bool, address::String, target::String)::String
@@ -1657,6 +2128,25 @@ function _read_all_response_bytes(io::IO)::Vector{UInt8}
     end
 end
 
+const _MAX_EAGER_RESPONSE_PREALLOC = Int64(1 << 20)
+
+function _read_all_response_bytes(body::AbstractBody; content_length_hint::Int64 = Int64(-1))::Vector{UInt8}
+    if 0 <= content_length_hint <= _MAX_EAGER_RESPONSE_PREALLOC
+        out = Vector{UInt8}(undef, Int(content_length_hint))
+        n = _copy_response_bytes!(out, body)
+        n == content_length_hint || resize!(out, Int(n))
+        return out
+    end
+    out = UInt8[]
+    content_length_hint > 0 && sizehint!(out, Int(min(content_length_hint, _MAX_EAGER_RESPONSE_PREALLOC)))
+    buf = Vector{UInt8}(undef, 8192)
+    while true
+        n = body_read!(body, buf)
+        n == 0 && return out
+        append!(out, @view(buf[1:n]))
+    end
+end
+
 function _copy_response_bytes!(dest::IO, io::IO)::Int64
     buf = Vector{UInt8}(undef, 8192)
     total = Int64(0)
@@ -1674,6 +2164,33 @@ function _copy_response_bytes!(dest::AbstractVector{UInt8}, io::IO)::Int64
     capacity = length(dest)
     while true
         n = readbytes!(io, buf, length(buf))
+        n == 0 && break
+        needed = total + n
+        needed <= capacity || throw(ArgumentError("Unable to grow response stream IOBuffer $(capacity) large enough for response body size: $(needed)"))
+        copyto!(dest, total + 1, buf, 1, n)
+        total = needed
+    end
+    dest isa Vector{UInt8} && resize!(dest::Vector{UInt8}, total)
+    return Int64(total)
+end
+
+function _copy_response_bytes!(dest::IO, body::AbstractBody)::Int64
+    buf = Vector{UInt8}(undef, 8192)
+    total = Int64(0)
+    while true
+        n = body_read!(body, buf)
+        n == 0 && return total
+        total += n
+        write(dest, view(buf, 1:n))
+    end
+end
+
+function _copy_response_bytes!(dest::AbstractVector{UInt8}, body::AbstractBody)::Int64
+    buf = Vector{UInt8}(undef, 8192)
+    total = 0
+    capacity = length(dest)
+    while true
+        n = body_read!(body, buf)
         n == 0 && break
         needed = total + n
         needed <= capacity || throw(ArgumentError("Unable to grow response stream IOBuffer $(capacity) large enough for response body size: $(needed)"))
@@ -1722,33 +2239,122 @@ function _pump_response_body!(stream::Base.BufferStream, body::AbstractBody)::No
     return nothing
 end
 
-function _response_body_reader(incoming::_IncomingResponse; decompress::Union{Nothing, Bool})::Tuple{IO, Task}
-    raw_stream = Base.BufferStream()
-    reader = if _should_decompress_response(incoming.head.headers, decompress)
-        CodecZlib.GzipDecompressorStream(raw_stream)
-    else
-        raw_stream
+mutable struct _BodyIO{B <: AbstractBody} <: IO
+    body::B
+    buf::Vector{UInt8}
+    next_index::Int
+    filled::Int
+    @atomic saw_eof::Bool
+    @atomic closed::Bool
+end
+
+function _BodyIO(body::B; buffer_bytes::Integer = 8192) where {B <: AbstractBody}
+    n = Int(buffer_bytes)
+    n > 0 || throw(ArgumentError("buffer_bytes must be > 0"))
+    return _BodyIO{B}(body, Vector{UInt8}(undef, n), 1, 0, false, false)
+end
+
+@inline function _buffered_bytes(io::_BodyIO)::Int
+    return max(io.filled - io.next_index + 1, 0)
+end
+
+function _fill_bodyio!(io::_BodyIO)::Int
+    (@atomic :acquire io.closed) && return 0
+    (@atomic :acquire io.saw_eof) && return 0
+    io.next_index = 1
+    n = body_read!(io.body, io.buf)
+    io.filled = n
+    if n == 0
+        @atomic :release io.saw_eof = true
     end
-    producer = errormonitor(Threads.@spawn _pump_response_body!(raw_stream, incoming.rawbody))
-    return reader, producer
+    return n
+end
+
+function Base.isopen(io::_BodyIO)::Bool
+    return !(@atomic :acquire io.closed)
+end
+
+function Base.bytesavailable(io::_BodyIO)::Int
+    return _buffered_bytes(io)
+end
+
+function Base.eof(io::_BodyIO)::Bool
+    _buffered_bytes(io) > 0 && return false
+    (@atomic :acquire io.closed) && return true
+    (@atomic :acquire io.saw_eof) && return true
+    return _fill_bodyio!(io) == 0
+end
+
+function Base.read(io::_BodyIO, ::Type{UInt8})::UInt8
+    eof(io) && throw(EOFError())
+    b = io.buf[io.next_index]
+    io.next_index += 1
+    return b
+end
+
+function Base.readbytes!(io::_BodyIO, dst::Vector{UInt8}, nb::Integer = length(dst))::Int
+    target = Int(nb)
+    target < 0 && throw(ArgumentError("nb must be >= 0"))
+    target = min(target, length(dst))
+    total = 0
+    while total < target
+        available = _buffered_bytes(io)
+        if available == 0
+            _fill_bodyio!(io) == 0 && break
+            available = _buffered_bytes(io)
+        end
+        chunk = min(available, target - total)
+        copyto!(dst, total + 1, io.buf, io.next_index, chunk)
+        io.next_index += chunk
+        total += chunk
+    end
+    return total
+end
+
+function Base.unsafe_read(io::_BodyIO, ptr::Ptr{UInt8}, nbytes::UInt)
+    remaining = Int(nbytes)
+    offset = 0
+    buf = io.buf
+    while remaining > 0
+        available = _buffered_bytes(io)
+        if available == 0
+            _fill_bodyio!(io) == 0 && throw(EOFError())
+            available = _buffered_bytes(io)
+        end
+        chunk = min(available, remaining)
+        GC.@preserve buf begin
+            unsafe_copyto!(ptr + offset, pointer(buf, io.next_index), chunk)
+        end
+        io.next_index += chunk
+        offset += chunk
+        remaining -= chunk
+    end
+    return nothing
+end
+
+function Base.close(io::_BodyIO)
+    if !(@atomic :acquire io.closed)
+        @atomic :release io.closed = true
+        @atomic :release io.saw_eof = true
+        io.next_index = 1
+        io.filled = 0
+        body_close!(io.body)
+    end
+    return nothing
+end
+
+function _response_body_reader(incoming::_IncomingResponse; decompress::Union{Nothing, Bool})::Tuple{IO, Union{Nothing, Task}}
+    raw_stream = _BodyIO(incoming.rawbody)
+    if _should_decompress_response(incoming.head.headers, decompress)
+        return CodecZlib.GzipDecompressorStream(raw_stream), nothing
+    end
+    return raw_stream, nothing
 end
 
 function _with_response_reader(f::F, incoming::_IncomingResponse; decompress::Union{Nothing, Bool}) where {F}
-    reader, producer = _response_body_reader(incoming; decompress = decompress)
+    reader, _ = _response_body_reader(incoming; decompress = decompress)
     try
-        result = f(reader)
-        wait(producer)
-        return result
-    catch
-        try
-            close(reader)
-        catch
-        end
-        try
-            wait(producer)
-        catch
-        end
-        rethrow()
+        return f(reader)
     finally
         try
             close(reader)
@@ -1772,6 +2378,29 @@ function _consume_incoming_response!(
         sink;
         decompress::Union{Nothing, Bool},
     )::Tuple{Any, Int64}
+    if !_should_decompress_response(incoming.head.headers, decompress)
+        try
+            if sink === nothing
+                body = _read_all_response_bytes(incoming.rawbody; content_length_hint = incoming.head.content_length)
+                return body, Int64(length(body))
+            end
+            if sink isa IO
+                n = _copy_response_bytes!(sink::IO, incoming.rawbody)
+                return nothing, n
+            end
+            n = _copy_response_bytes!(sink::AbstractVector{UInt8}, incoming.rawbody)
+            if sink isa Vector{UInt8}
+                return sink::Vector{UInt8}, n
+            end
+            return view(sink::AbstractVector{UInt8}, 1:Int(n)), n
+        catch
+            try
+                body_close!(incoming.rawbody)
+            catch
+            end
+            rethrow()
+        end
+    end
     return _with_response_reader(incoming; decompress = decompress) do reader
         if sink === nothing
             body = _read_all_response_bytes(reader)
@@ -1918,68 +2547,76 @@ function _append_query(target::String, query)::String
 end
 
 function _parse_http_url(url::AbstractString; query = nothing)::_URLParts
-    s = String(url)
+    s = url isa String ? url : String(url)
+    bytes = codeunits(s)
     scheme_idx = findfirst("://", s)
     scheme_idx === nothing && throw(ArgumentError("URL must include http:// or https:// scheme: $s"))
     scheme_start = first(scheme_idx)
     scheme_end = last(scheme_idx)
-    scheme = lowercase(String(SubString(s, firstindex(s), prevind(s, scheme_start))))
-    secure = if scheme == "http"
+    scheme_last = prevind(s, scheme_start)
+    secure = if _ascii_equal_fold_literal(bytes, firstindex(s), scheme_last, "http")
         false
-    elseif scheme == "https"
+    elseif _ascii_equal_fold_literal(bytes, firstindex(s), scheme_last, "https")
         true
     else
+        scheme = String(SubString(s, firstindex(s), scheme_last))
         throw(ArgumentError("unsupported URL scheme '$scheme'; expected http or https"))
     end
     rest_start = nextind(s, scheme_end)
     rest_start > lastindex(s) && throw(ArgumentError("URL missing authority: $s"))
-    rest = String(SubString(s, rest_start, lastindex(s)))
-    fragment_idx = findfirst('#', rest)
-    fragment_idx === nothing || (rest = String(SubString(rest, firstindex(rest), prevind(rest, fragment_idx))))
-    sep = findfirst(c -> c == '/' || c == '?', rest)
-    authority = ""
-    target = "/"
-    if sep === nothing
-        authority = rest
-    else
-        authority = String(SubString(rest, firstindex(rest), prevind(rest, sep)))
-        raw_target = String(SubString(rest, sep, lastindex(rest)))
-        if startswith(raw_target, "?")
-            target = string("/", raw_target)
-        else
-            target = raw_target
-        end
-    end
-    authorization = nothing
-    at_idx = findlast('@', authority)
+    fragment_idx = _find_url_byte(bytes, rest_start, lastindex(s), UInt8('#'))
+    rest_last = fragment_idx === nothing ? lastindex(s) : prevind(s, fragment_idx)
+    sep = _find_first_url_sep(bytes, rest_start, rest_last)
+    authority_range = sep === nothing ? _text_range(rest_start, rest_last) : _text_range(rest_start, prevind(s, sep))
+    target_range = sep === nothing ? _EMPTY_TEXT_RANGE : _text_range(sep, rest_last)
+    target_starts_with_query = sep !== nothing && @inbounds bytes[sep] == UInt8('?')
+
+    userinfo_range = _EMPTY_TEXT_RANGE
+    has_userinfo = false
+    at_idx = _text_range_empty(authority_range) ? nothing : _find_last_url_byte(bytes, authority_range.first, authority_range.last, UInt8('@'))
     if at_idx !== nothing
-        user_info = String(SubString(authority, firstindex(authority), prevind(authority, at_idx)))
-        authority = String(SubString(authority, nextind(authority, at_idx), lastindex(authority)))
-        if !isempty(user_info)
-            parts = split(user_info, ':'; limit = 2)
-            username = parts[1]
-            password = length(parts) == 2 ? parts[2] : ""
-            authorization = "Basic " * base64encode(string(username, ":", password))
-        end
+        userinfo_range = _text_range(authority_range.first, prevind(s, at_idx))
+        has_userinfo = !_text_range_empty(userinfo_range)
+        authority_range = _text_range(nextind(s, at_idx), authority_range.last)
     end
-    isempty(authority) && throw(ArgumentError("URL missing host: $s"))
-    address = ""
-    if startswith(authority, "[")
-        if occursin("]:", authority)
-            address = authority
-        else
-            close_idx = findfirst(']', authority)
-            close_idx === nothing && throw(ArgumentError("invalid IPv6 host authority: $authority"))
-            host = String(SubString(authority, nextind(authority, firstindex(authority)), prevind(authority, close_idx)))
-            address = HostResolvers.join_host_port(host, secure ? 443 : 80)
+
+    _text_range_empty(authority_range) && throw(ArgumentError("URL missing host: $s"))
+
+    host_range = authority_range
+    has_explicit_port = false
+    if @inbounds bytes[authority_range.first] == UInt8('[')
+        close_idx = _find_url_byte(bytes, authority_range.first, authority_range.last, UInt8(']'))
+        close_idx === nothing && throw(ArgumentError("invalid IPv6 host authority: $(_text_range_string(s, authority_range))"))
+        host_range = _text_range(nextind(s, authority_range.first), prevind(s, close_idx))
+        if close_idx < authority_range.last
+            next_after_close = nextind(s, close_idx)
+            has_explicit_port = next_after_close <= authority_range.last && @inbounds(bytes[next_after_close] == UInt8(':'))
         end
     else
-        address = occursin(':', authority) ? authority : HostResolvers.join_host_port(authority, secure ? 443 : 80)
+        has_explicit_port = _find_last_url_byte(bytes, authority_range.first, authority_range.last, UInt8(':')) !== nothing
+        has_explicit_port || (host_range = authority_range)
     end
-    target = _append_query(target, query)
-    host, _ = HostResolvers.split_host_port(address)
-    full_url = string(scheme, "://", address, target)
-    return _URLParts(secure, address, target, host, full_url, authorization)
+
+    query_suffix = query === nothing ? "" : _query_string(query)
+    default_port = secure ? UInt16(443) : UInt16(80)
+    return _URLParts(
+        s,
+        secure,
+        default_port,
+        authority_range,
+        host_range,
+        userinfo_range,
+        target_range,
+        query_suffix,
+        has_explicit_port,
+        target_starts_with_query,
+        has_userinfo,
+        "",
+        "",
+        "",
+        "",
+        "",
+    )
 end
 
 function _method_upper(method::Union{AbstractString, Symbol})::String
@@ -2256,20 +2893,20 @@ end
 
 function _retry_policy_response(incoming::_IncomingResponse, fallback_request::Request)::Response
     head = incoming.head
-    return Response(
-        head.status_code;
-        reason = head.reason,
-        headers = head.headers,
-        trailers = head.trailers,
-        body = nothing,
-        content_length = head.content_length,
-        proto_major = head.proto_major,
-        proto_minor = head.proto_minor,
-        close = head.close,
-        request = head.request === nothing ? fallback_request : (head.request::Request),
-        request_url = head.request_url,
-        previous = head.previous,
-        redirect_count = head.redirect_count,
+    return _response_nocopy_public(
+        head.status_code,
+        head.reason,
+        head.headers,
+        head.trailers,
+        nothing,
+        head.content_length,
+        head.proto_major,
+        head.proto_minor,
+        head.close,
+        head.request === nothing ? fallback_request : (head.request::Request),
+        head.request_url,
+        head.previous,
+        head.redirect_count,
     )
 end
 
@@ -2456,20 +3093,20 @@ function _finalize_request_response(
         resolved_request::Request,
         request_url::String,
     )::Response
-    return Response(
-        incoming.head.status_code;
-        reason = incoming.head.reason,
-        headers = incoming.head.headers,
-        trailers = incoming.head.trailers,
-        body = body,
-        content_length = body_length,
-        proto_major = incoming.head.proto_major,
-        proto_minor = incoming.head.proto_minor,
-        close = incoming.head.close,
-        request = resolved_request,
-        request_url = incoming.head.request_url === nothing ? request_url : (incoming.head.request_url::String),
-        previous = incoming.head.previous,
-        redirect_count = incoming.head.redirect_count,
+    return _response_nocopy_public(
+        incoming.head.status_code,
+        incoming.head.reason,
+        incoming.head.headers,
+        incoming.head.trailers,
+        body,
+        body_length,
+        incoming.head.proto_major,
+        incoming.head.proto_minor,
+        incoming.head.close,
+        resolved_request,
+        incoming.head.request_url === nothing ? request_url : (incoming.head.request_url::String),
+        incoming.head.previous,
+        incoming.head.redirect_count,
     )
 end
 
