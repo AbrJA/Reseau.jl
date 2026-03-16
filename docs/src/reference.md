@@ -1,101 +1,165 @@
-# API Reference
+```@meta
+CollapsedDocStrings = true
+Description = "Canonical API reference for Reseau.jl's TCP, TLS, and name-resolution surfaces."
+```
 
-Reseau keeps its public surface module-qualified. That is intentional: it makes
-the layer boundaries obvious.
+# [API Reference](@id api-reference-manual)
 
-## `Reseau.TCP`
+This page is the canonical home for the package and module docstrings used
+throughout the rest of the manual.
 
-### Address constructors
+```@contents
+Pages = ["reference.md"]
+Depth = 2:2
+```
 
-- `Reseau.TCP.SocketAddrV4`
-- `Reseau.TCP.SocketAddrV6`
-- `Reseau.TCP.loopback_addr`
-- `Reseau.TCP.any_addr`
-- `Reseau.TCP.loopback_addr6`
-- `Reseau.TCP.any_addr6`
+## Package Modules
 
-### Connections and listeners
+```@docs
+Reseau
+Reseau.TCP
+Reseau.TLS
+```
 
-- `Reseau.TCP.connect`
-- `Reseau.TCP.listen`
-- `Reseau.TCP.accept!`
-- `Reseau.TCP.close!`
-- `Reseau.TCP.close_read!`
-- `Reseau.TCP.close_write!`
+### Internal Layers
 
-### Deadlines and socket options
+These modules are not the primary end-user entrypoints, but they explain the
+package layering and are part of the documented rewrite architecture:
 
-- `Reseau.TCP.set_deadline!`
-- `Reseau.TCP.set_read_deadline!`
-- `Reseau.TCP.set_write_deadline!`
-- `Reseau.TCP.set_nodelay!`
-- `Reseau.TCP.set_keepalive!`
+```@docs
+Reseau.EventLoops
+Reseau.SocketOps
+Reseau.IOPoll
+Reseau.IOPoll.PollOp
+Reseau.HostResolvers
+```
 
-### Address inspection
+## TCP
 
-- `Reseau.TCP.local_addr`
-- `Reseau.TCP.remote_addr`
-- `Reseau.TCP.addr`
+```@meta
+CurrentModule = Reseau.TCP
+```
 
-## `Reseau.HostResolvers`
+### Address Types and Constructors
 
-### Address parsing and lookup
+```@docs
+SocketAddr
+SocketAddrV4
+SocketAddrV6
+loopback_addr
+any_addr
+loopback_addr6
+any_addr6
+```
 
-- `Reseau.HostResolvers.join_host_port`
-- `Reseau.HostResolvers.split_host_port`
-- `Reseau.HostResolvers.parse_port`
-- `Reseau.HostResolvers.lookup_port`
-- `Reseau.HostResolvers.resolve_tcp_addr`
-- `Reseau.HostResolvers.resolve_tcp_addrs`
+### Connections and I/O
 
-### Dial/listen helpers
+```@docs
+Conn
+Listener
+connect
+listen
+accept
+Base.read!(::Conn, ::Vector{UInt8})
+Base.write(::Conn, ::AbstractVector{UInt8})
+Base.close(::Conn)
+Base.close(::Listener)
+closeread
+Base.closewrite(::Conn)
+```
 
-- `Reseau.HostResolvers.connect`
-- `Reseau.HostResolvers.listen`
-- `Reseau.HostResolvers.HostResolver`
+### Deadlines, Socket Options, and Address Inspection
 
-### Resolver helpers
+```@docs
+set_deadline!
+set_read_deadline!
+set_write_deadline!
+set_nodelay!
+set_keepalive!
+local_addr
+remote_addr
+addr
+```
 
-- `Reseau.HostResolvers.ResolverPolicy`
-- `Reseau.HostResolvers.SystemResolver`
-- `Reseau.HostResolvers.StaticResolver`
-- `Reseau.HostResolvers.CachingResolver`
-- `Reseau.HostResolvers.SingleflightResolver`
+## Name Resolution
 
-## `Reseau.TLS`
+```@meta
+CurrentModule = Reseau.HostResolvers
+```
 
-### Main types
+### Policy and Resolver Types
 
-- `Reseau.TLS.Config`
-- `Reseau.TLS.Conn`
-- `Reseau.TLS.Listener`
-- `Reseau.TLS.ClientAuthMode`
+```@docs
+ResolverPolicy
+SystemResolver
+SingleflightResolver
+CachingResolver
+StaticResolver
+HostResolver
+```
 
-### Client and server setup
+### Explicit Resolution Helpers
 
-- `Reseau.TLS.connect`
-- `Reseau.TLS.listen`
-- `Reseau.TLS.client`
-- `Reseau.TLS.server`
-- `Reseau.TLS.accept!`
-- `Reseau.TLS.handshake!`
+```@docs
+resolve_tcp_addrs
+resolve_tcp_addr
+```
 
-### Lifecycle and inspection
+## TLS
 
-- `Reseau.TLS.close!`
-- `Reseau.TLS.addr`
+```@meta
+CurrentModule = Reseau.TLS
+```
 
-### Errors
+### Configuration, State, and Errors
 
-- `Reseau.TLS.ConfigError`
-- `Reseau.TLS.TLSError`
-- `Reseau.TLS.TLSHandshakeTimeoutError`
+```@docs
+Config
+ConnectionState
+Conn
+Listener
+ConfigError
+TLSError
+TLSHandshakeTimeoutError
+```
 
-## Package Boundary Note
+### Client and Server Construction
 
-HTTP-related APIs are intentionally no longer part of Reseau. Use HTTP.jl for:
+```@docs
+client
+server
+connect
+listen
+accept
+handshake!
+```
 
-- request/response handling
-- HTTP clients and servers
-- WebSockets
-- HPACK and HTTP/2
+### I/O, Lifecycle, Deadlines, and Inspection
+
+```@docs
+Base.read!(::Conn, ::Vector{UInt8})
+Base.write(::Conn, ::AbstractVector{UInt8})
+Base.close(::Conn)
+Base.close(::Listener)
+Base.closewrite(::Conn)
+set_deadline!
+set_read_deadline!
+set_write_deadline!
+local_addr
+remote_addr
+net_conn
+connection_state
+addr
+```
+
+## Docstring Index
+
+```@meta
+CurrentModule = Main
+```
+
+```@index
+Pages = ["reference.md"]
+Modules = [Reseau, Reseau.TCP, Reseau.HostResolvers, Reseau.TLS]
+Order = [:module, :type, :function]
+```

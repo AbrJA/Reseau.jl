@@ -1,98 +1,105 @@
-# TCP and Resolution
-
-Reseau splits TCP work into two layers:
-
-- `Reseau.TCP` for concrete socket addresses
-- `Reseau.HostResolvers` for string-address parsing, host resolution, and
-  timeout-aware dialing
-
-## `Reseau.TCP`
-
-Use `Reseau.TCP` when you already know the exact address family and endpoint you
-want.
-
-### Address Types
-
-- `Reseau.TCP.SocketAddrV4`
-- `Reseau.TCP.SocketAddrV6`
-- `Reseau.TCP.loopback_addr`
-- `Reseau.TCP.any_addr`
-- `Reseau.TCP.loopback_addr6`
-- `Reseau.TCP.any_addr6`
-
-### Connections and Listeners
-
-```julia
-using Reseau
-
-addr = Reseau.TCP.loopback_addr(9000)
-listener = Reseau.TCP.listen(addr; backlog=128, reuseaddr=true)
-conn = Reseau.TCP.accept!(listener)
+```@meta
+CurrentModule = Reseau.TCP
+Description = "TCP connections, listeners, deadlines, socket options, and address helpers in Reseau.jl."
 ```
 
-Client connections are just as direct:
+# [TCP](@id tcp-manual)
 
-```julia
-using Reseau
+`TCP` is the plain-transport entrypoint in Reseau. The same [`connect`](@ref)
+and [`listen`](@ref) surface supports both concrete socket addresses and
+hostname-based string addresses. Read [Name Resolution](@ref name-resolution-manual) for the resolver
+and policy objects behind the string-address overloads.
 
-conn = Reseau.TCP.connect(Reseau.TCP.loopback_addr(9000))
-write(conn, collect(codeunits("hello")))
-buf = Vector{UInt8}(undef, 5)
-read!(conn, buf)
+```@contents
+Pages = ["tcp.md"]
+Depth = 2:3
 ```
 
-### Deadlines and Shutdown
+## Address Model
 
-These are important differences from `Sockets`:
+Use concrete addresses when you already know the exact family and endpoint you
+want to target. Reseau exposes both IPv4 and IPv6 address snapshots:
 
-- `Reseau.TCP.set_deadline!(conn, deadline_ns)`
-- `Reseau.TCP.set_read_deadline!(conn, deadline_ns)`
-- `Reseau.TCP.set_write_deadline!(conn, deadline_ns)`
-- `Reseau.TCP.close_read!(conn)`
-- `Reseau.TCP.close_write!(conn)`
-
-### Address Inspection
-
-- `Reseau.TCP.local_addr(conn)`
-- `Reseau.TCP.remote_addr(conn)`
-- `Reseau.TCP.addr(listener)`
-
-## `Reseau.HostResolvers`
-
-Use `HostResolvers` when you want the package to handle host parsing and
-resolution for you.
-
-### Common Entry Points
-
-- `Reseau.HostResolvers.connect("tcp", "example.com:443")`
-- `Reseau.HostResolvers.connect("example.com:443")`
-- `Reseau.HostResolvers.listen("tcp", "127.0.0.1:9000")`
-- `Reseau.HostResolvers.resolve_tcp_addr`
-- `Reseau.HostResolvers.resolve_tcp_addrs`
-- `Reseau.HostResolvers.lookup_port`
-- `Reseau.HostResolvers.join_host_port`
-- `Reseau.HostResolvers.split_host_port`
-
-### Example
-
-```julia
-using Reseau
-
-listener = Reseau.HostResolvers.listen("tcp", "127.0.0.1:9000")
-conn = Reseau.HostResolvers.connect("tcp", "127.0.0.1:9000")
-peer = Reseau.TCP.accept!(listener)
+```@docs; canonical=false
+SocketAddr
+SocketAddrV4
+SocketAddrV6
+loopback_addr
+any_addr
+loopback_addr6
+any_addr6
 ```
 
-### Resolution Policies
+Concrete addresses are especially useful when you want to bind explicitly to a
+family or pass a preselected local address to outbound dialing.
 
-`HostResolvers` also owns the higher-level resolution helpers:
+## Connections and Listeners
 
-- `ResolverPolicy`
-- `SystemResolver`
-- `StaticResolver`
-- `CachingResolver`
-- `SingleflightResolver`
-- `HostResolver`
+The core connection surface is small and intentionally transport-focused:
 
-These are the right tools when you want to tune IPv4/IPv6 preference,
-cache lookups, or control resolution behavior explicitly.
+```@docs; canonical=false
+Conn
+Listener
+connect
+listen
+accept
+```
+
+For `"host:port"` dialing, the string-address overloads accept:
+
+- `timeout_ns`
+- `deadline_ns`
+- `local_addr`
+- `fallback_delay_ns`
+- `resolver`
+- `policy`
+
+Those knobs feed the resolver layer described in [Name Resolution](@ref name-resolution-manual), while
+the actual socket lifecycle still lands in the same `TCP.Conn` and
+`TCP.Listener` types.
+
+## Stream I/O and Lifecycle
+
+`TCP.Conn` follows Julia's standard stream conventions for `read!`, `write`,
+and `close`, while still exposing explicit half-close helpers when you need
+them:
+
+```@docs; canonical=false
+Base.read!(::Conn, ::Vector{UInt8})
+Base.write(::Conn, ::AbstractVector{UInt8})
+Base.close(::Conn)
+Base.close(::Listener)
+closeread
+Base.closewrite(::Conn)
+```
+
+The important behavioral detail is that partial reads and writes are normal:
+reads return as soon as at least one byte is available, and writes retry
+through readiness waits until the requested payload has been written or an
+error/deadline interrupts the operation.
+
+## Deadlines, Socket Options, and Address Inspection
+
+Deadline management lives on the live connection, not in helper tasks or
+external timeout wrappers:
+
+```@docs; canonical=false
+set_deadline!
+set_read_deadline!
+set_write_deadline!
+set_nodelay!
+set_keepalive!
+local_addr
+remote_addr
+addr
+```
+
+Use absolute monotonic nanoseconds from `time_ns()` for deadline APIs. Setting
+a deadline to `0` clears it, while setting it to a time in the past makes the
+next blocking wait time out immediately.
+
+## Where To Go Next
+
+- Read [TLS](@ref tls-manual) for the TLS wrapper layer that reuses the same transport and deadline model.
+- Read [Name Resolution](@ref name-resolution-manual) for `ResolverPolicy`, `HostResolver`, and explicit resolution helpers.
+- Read [API Reference](@ref api-reference-manual) for the canonical docstrings for the entire TCP surface.

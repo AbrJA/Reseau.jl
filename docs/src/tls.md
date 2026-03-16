@@ -1,87 +1,106 @@
-# TLS
-
-`Reseau.TLS` is the TLS layer that wraps `Reseau.TCP` connections and listeners.
-It uses a Go-style split between reusable configuration and per-connection state.
-
-## Core Types
-
-- `Reseau.TLS.Config`
-- `Reseau.TLS.Conn`
-- `Reseau.TLS.Listener`
-- `Reseau.TLS.ClientAuthMode`
-
-Important error types:
-
-- `Reseau.TLS.ConfigError`
-- `Reseau.TLS.TLSError`
-- `Reseau.TLS.TLSHandshakeTimeoutError`
-
-## Client Connections
-
-The easiest path is `Reseau.TLS.connect`:
-
-```julia
-using Reseau
-
-conn = Reseau.TLS.connect(
-    "tcp",
-    "example.com:443";
-    verify_peer=true,
-    alpn_protocols=["h2", "http/1.1"],
-)
+```@meta
+CurrentModule = Reseau.TLS
+Description = "TLS clients, listeners, configuration, and handshake behavior in Reseau.jl."
 ```
 
-If you already have a `Reseau.TCP.Conn`, wrap it with `Reseau.TLS.client`:
+# [TLS](@id tls-manual)
 
-```julia
-using Reseau
+`TLS` wraps `TCP` connections and listeners with OpenSSL-backed TLS state while
+keeping deadlines and socket lifecycle aligned with the underlying transport.
+String-address client dialing uses the same resolver/policy layer as
+[`Reseau.TCP.connect`](@ref Reseau.TCP.connect); see [Name Resolution](@ref name-resolution-manual)
+for that part of the stack.
 
-tcp = Reseau.HostResolvers.connect("tcp", "example.com:443")
-cfg = Reseau.TLS.Config(alpn_protocols=["h2", "http/1.1"])
-tls = Reseau.TLS.client(tcp, cfg)
-Reseau.TLS.handshake!(tls)
+```@contents
+Pages = ["tls.md"]
+Depth = 2:3
 ```
 
-## Server Listeners
+## Configuration, Types, and Errors
 
-Construct a reusable `Config`, then build a TLS listener:
+The main TLS building blocks are:
 
-```julia
-using Reseau
-
-cfg = Reseau.TLS.Config(
-    cert_file="server.crt",
-    key_file="server.key",
-    alpn_protocols=["h2", "http/1.1"],
-)
-
-listener = Reseau.TLS.listen("tcp", "127.0.0.1:8443", cfg)
-conn = Reseau.TLS.accept!(listener)
+```@docs; canonical=false
+Config
+ConnectionState
+Conn
+Listener
+ConfigError
+TLSError
+TLSHandshakeTimeoutError
 ```
 
-Accepted connections are returned in lazy-handshake form, just like Go's
-`crypto/tls`.
+`ClientAuthMode` is an enum-like policy surface with the following cases:
 
-## Configuration Highlights
+- `TLS.ClientAuthMode.NoClientCert`
+- `TLS.ClientAuthMode.RequestClientCert`
+- `TLS.ClientAuthMode.RequireAnyClientCert`
+- `TLS.ClientAuthMode.VerifyClientCertIfGiven`
+- `TLS.ClientAuthMode.RequireAndVerifyClientCert`
 
-Useful `Config` keywords include:
+For server-side verified client-certificate auth, provide `client_ca_file`
+explicitly in [`Config`](@ref).
 
-- `server_name`
-- `verify_peer`
-- `client_auth`
-- `cert_file`
-- `key_file`
-- `ca_file`
-- `client_ca_file`
-- `alpn_protocols`
-- `handshake_timeout_ns`
-- `min_version`
-- `max_version`
+## Client and Server Construction
 
-## Operational Notes
+You can either dial and handshake a client in one step, or wrap an existing
+`TCP.Conn` manually:
 
-- Deadline handling stays aligned with the underlying transport.
-- `server_name` is inferred from dial targets when possible.
-- ALPN is the key bridge between Reseau and HTTP.jl's HTTP/2 behavior.
-- This is the layer to configure certificates and peer verification; HTTP.jl
-  should receive an already-prepared listener or connection policy.
+```@docs; canonical=false
+client
+server
+connect
+listen
+accept
+handshake!
+```
+
+Important behaviors to keep in mind:
+
+- [`connect`](@ref) returns a fully handshaken client connection.
+- [`listen`](@ref) returns a TLS listener whose accepted connections are
+  lazy-handshake wrappers.
+- [`client`](@ref) and [`server`](@ref) are the direct wrapping APIs when you
+  already control the underlying `TCP.Conn`.
+- [`handshake!`](@ref) is idempotent, so eager and lazy handshake styles can coexist safely.
+
+## I/O, Lifecycle, Deadlines, and Inspection
+
+TLS connections still behave like Julia streams, but now read and write operate
+on plaintext application data while OpenSSL handles record framing underneath:
+
+```@docs; canonical=false
+Base.read!(::Conn, ::Vector{UInt8})
+Base.write(::Conn, ::AbstractVector{UInt8})
+Base.close(::Conn)
+Base.close(::Listener)
+Base.closewrite(::Conn)
+set_deadline!
+set_read_deadline!
+set_write_deadline!
+local_addr
+remote_addr
+net_conn
+connection_state
+addr
+```
+
+Two details matter in practice:
+
+- TLS deadlines are delegated to the wrapped TCP transport, so the timeout
+  model matches [TCP](@ref tcp-manual) exactly.
+- A timed-out TLS write is treated as a permanent write failure, mirroring Go's
+  `crypto/tls` behavior where partial record emission leaves future writes
+  unsafe.
+
+## Practical Usage Notes
+
+- If `server_name` is omitted, [`connect`](@ref) derives it from the dial target when possible so SNI and certificate verification behave like Go's defaults.
+- If `ca_file` is omitted for outbound verification, Reseau falls back to `NetworkOptions.ca_roots_path()` when that path is available.
+- [`connection_state`](@ref) does not force the handshake to run; it reports the current negotiated state as-is.
+
+## Where To Go Next
+
+- Read [TCP](@ref tcp-manual) for the underlying transport model and socket lifecycle.
+- Read [Name Resolution](@ref name-resolution-manual) for resolver and address-family policy controls shared by `TCP.connect` and `TLS.connect`.
+- Read [API Reference](@ref api-reference-manual) for the canonical TLS docstrings.

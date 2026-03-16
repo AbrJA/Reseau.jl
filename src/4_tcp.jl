@@ -20,17 +20,26 @@ using ..Reseau.SocketOps
 
 """
     connect
-    listen
 
-Primary user-facing TCP entry points.
-
-This file defines the concrete-address methods like `connect(::SocketAddr)` and
-`listen(::SocketAddr)`. String/hostname-based overloads are added later by the
-`HostResolvers` module so callers can still use one unified `TCP.connect` /
-`TCP.listen` surface.
+Connect a TCP client using either a concrete `SocketAddr` or a string-address
+overload added later in the file load order.
 """
 function connect end
+
+"""
+    listen
+
+Create a TCP listener from either a concrete `SocketAddr` or a string-address
+overload added later in the file load order.
+"""
 function listen end
+
+"""
+    accept
+
+Accept one inbound `Conn` from a `TCP.Listener`.
+"""
+function accept end
 
 """
     SocketAddr
@@ -373,7 +382,7 @@ function _wait_connect_complete!(
                 # This mirrors Go's non-blocking connect completion path:
                 # wait for writability, then inspect `SO_ERROR` to learn whether
                 # the connection actually succeeded.
-                IOPoll.wait_write!(fd.pfd.pd)
+                IOPoll.waitwrite(fd.pfd.pd)
             catch err
                 ex = err::Exception
                 if ex isa IOPoll.DeadlineExceededError && _connect_canceled(cancel_state)
@@ -433,32 +442,23 @@ function open_tcp_fd!(; family::Cint = SocketOps.AF_INET)::FD
 end
 
 """
-    connect_tcp_fd!(remote_addr; local_addr=nothing, connect_deadline_ns=0)
+    connect(remote_addr; local_addr=nothing)
 
-Create and connect a non-blocking TCP `FD` using Go-style connect completion:
-wait write-ready, then verify with `SO_ERROR`.
+Connect a TCP connection and return `Conn`.
 
-Arguments:
-- `remote_addr`: remote endpoint to connect to
-- `local_addr`: optional source address to bind before connecting
-- `connect_deadline_ns`: absolute monotonic deadline used for the write-wait path
-- `cancel_state`: internal cancellation hook used by parallel dial racing
+This is the simplest direct-address API. For host/port strings, name
+resolution, and timeout-aware connect policy, use the `connect(network,
+address...)` overloads on the same `TCP.connect` generic.
 
-Returns the connected internal `FD`.
-
-Throws:
-- `ArgumentError` if local/remote address families do not match
-- `SystemError` for socket, bind, connect, or socket-option failures
-- `IOPoll.DeadlineExceededError` if the connect wait times out
-- `ConnectCanceledError` when a higher-level parallel dial path cancels the
-  attempt after another candidate wins
+Internal callers may also pass `connect_deadline_ns` and `cancel_state` to
+reuse the same implementation for deadline- and race-aware dial paths.
 """
-function connect_tcp_fd!(
+function connect(
         remote_addr::SocketAddr;
         local_addr::Union{Nothing, SocketAddr} = nothing,
         connect_deadline_ns::Integer = Int64(0),
         cancel_state = nothing,
-    )::FD
+    )::Conn
     family = _addr_family(remote_addr)
     if local_addr !== nothing && _addr_family(local_addr) != family
         throw(ArgumentError("local and remote address families must match"))
@@ -494,14 +494,14 @@ function connect_tcp_fd!(
                 end
             end
             _apply_default_tcp_opts!(fd)
-            return fd
+            return Conn(fd)
         end
         errno = SocketOps.connect_socket(fd.pfd.sysfd, _to_sockaddr(remote_addr))
         if errno == Int32(0) || errno == Int32(Base.Libc.EISCONN)
             IOPoll.init!(fd.pfd; net = :tcp, pollable = true)
             _finalize_connected_addrs!(fd, remote_addr)
             _apply_default_tcp_opts!(fd)
-            return fd
+            return Conn(fd)
         end
         _is_connect_pending_errno(errno) || throw(SystemError("connect", Int(errno)))
         IOPoll.init!(fd.pfd; net = :tcp, pollable = true)
@@ -523,26 +523,22 @@ function connect_tcp_fd!(
             end
         end
         _apply_default_tcp_opts!(fd)
-        return fd
+        return Conn(fd)
     catch
-        close!(fd)
+        close(fd)
         rethrow()
     end
 end
 
 """
-    listen_tcp_fd!(local_addr; backlog=128, reuseaddr=true)
+    listen(local_addr; backlog=128, reuseaddr=true)
 
-Create a listening TCP `FD` bound to `local_addr`.
+Create a TCP listener from a bound local address.
 
-Keyword arguments:
-- `backlog`: listen backlog passed to the kernel
-- `reuseaddr`: whether to enable `SO_REUSEADDR` before binding
-
-Returns an internal listening `FD`. Throws `SystemError` on bind/listen/setup
-failures.
+This is the direct-address equivalent of the `listen(network, address; ...)`
+overloads on the same `TCP.listen` generic.
 """
-function listen_tcp_fd!(local_addr::SocketAddr; backlog::Integer = 128, reuseaddr::Bool = true)::FD
+function listen(local_addr::SocketAddr; backlog::Integer = 128, reuseaddr::Bool = true)::Listener
     family = _addr_family(local_addr)
     fd = open_tcp_fd!(; family = family)
     try
@@ -551,22 +547,23 @@ function listen_tcp_fd!(local_addr::SocketAddr; backlog::Integer = 128, reuseadd
         SocketOps.listen_socket(fd.pfd.sysfd, backlog)
         IOPoll.init!(fd.pfd; net = :tcp, pollable = true)
         _set_local_addr!(fd)
-        return fd
+        return Listener(fd)
     catch
-        close!(fd)
+        close(fd)
         rethrow()
     end
 end
 
 """
-    accept_tcp_fd!(listener_fd)
+    accept(listener)
 
-Accept a child TCP connection, retrying transient accept errors with Go parity.
+Accept a new `Conn` from `listener`.
 
-The returned child descriptor is already poll-initialized and has the default
-TCP options applied, so callers can immediately wrap it in `Conn`.
+Throws `SystemError`, `IOPoll.DeadlineExceededError`, or other poll/transport
+errors if the underlying accept path fails.
 """
-function accept_tcp_fd!(listener_fd::FD)::FD
+function accept(listener::Listener)::Conn
+    listener_fd = listener.fd
     child_sysfd, peer_addr = IOPoll.accept!(listener_fd.pfd, listener_fd.family, listener_fd.sotype)
     child = _new_netfd(
         child_sysfd;
@@ -581,48 +578,11 @@ function accept_tcp_fd!(listener_fd::FD)::FD
         _set_local_addr!(child)
         _set_remote_addr_from_accept!(child, peer_addr)
         @atomic :release child.is_connected = true
-        return child
+        return Conn(child)
     catch
-        close!(child)
+        close(child)
         rethrow()
     end
-end
-
-"""
-    connect(remote_addr; local_addr=nothing)
-
-Connect a TCP connection and return `Conn`.
-
-This is the simplest direct-address API. For host/port strings, name
-resolution, and timeout-aware connect policy, use the `connect(network,
-address...)` overloads on the same `TCP.connect` generic.
-"""
-function connect(remote_addr::SocketAddr; local_addr::Union{Nothing, SocketAddr} = nothing)::Conn
-    return Conn(connect_tcp_fd!(remote_addr; local_addr = local_addr))
-end
-
-"""
-    listen(local_addr; backlog=128, reuseaddr=true)
-
-Create a TCP listener from a bound local address.
-
-This is the direct-address equivalent of the `listen(network, address; ...)`
-overloads on the same `TCP.listen` generic.
-"""
-function listen(local_addr::SocketAddr; backlog::Integer = 128, reuseaddr::Bool = true)::Listener
-    return Listener(listen_tcp_fd!(local_addr; backlog = backlog, reuseaddr = reuseaddr))
-end
-
-"""
-    accept!(listener)
-
-Accept a new `Conn` from `listener`.
-
-Throws `SystemError`, `IOPoll.DeadlineExceededError`, or other poll/transport
-errors if the underlying accept path fails.
-"""
-function accept!(listener::Listener)::Conn
-    return Conn(accept_tcp_fd!(listener.fd))
 end
 
 """
@@ -674,52 +634,52 @@ function Base.write(conn::Conn, buf::ByteMemory, nbytes::Integer)::Int
 end
 
 """
-    close!(conn)
+    close(conn)
 
 Close the connection. Repeated closes are treated as no-ops.
 """
-function close!(conn::Conn)
-    close!(conn.fd)
+function Base.close(conn::Conn)
+    close(conn.fd)
     return nothing
 end
 
 """
-    close!(listener)
+    close(listener)
 
 Close the listening socket. Repeated closes are treated as no-ops.
 """
-function close!(listener::Listener)
-    close!(listener.fd)
+function Base.close(listener::Listener)
+    close(listener.fd)
     return nothing
 end
 
 """
-    close_read!(conn)
+    closeread(conn)
 
 Shut down the read side of the TCP connection.
 """
-function close_read!(conn::Conn)
+function closeread(conn::Conn)
     SocketOps.shutdown_socket(conn.fd.pfd.sysfd, SocketOps.SHUT_RD)
     return nothing
 end
 
 """
-    close_write!(conn)
+    closewrite(conn)
 
 Shut down the write side of the TCP connection.
 """
-function close_write!(conn::Conn)
+function Base.closewrite(conn::Conn)
     SocketOps.shutdown_socket(conn.fd.pfd.sysfd, SocketOps.SHUT_WR)
     return nothing
 end
 
 """
-    close!(fd::FD)
+    close(fd)
 
 Close a net descriptor. Repeated closes are treated as no-op.
 """
-function close!(fd::FD)
-    IOPoll.close!(fd.pfd)
+function Base.close(fd::FD)
+    close(fd.pfd)
     return nothing
 end
 
