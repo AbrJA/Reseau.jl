@@ -18,6 +18,7 @@ resolution logic remains factored into its own file.
 module HostResolvers
 
 using ..Reseau: @gcsafe_ccall
+using ..Reseau.EventLoops
 using ..Reseau.SocketOps
 using ..Reseau.IOPoll
 
@@ -384,6 +385,8 @@ end
 function _native_getaddrinfo(hostname::AbstractString; flags::Cint = Cint(0))::Vector{TCP.SocketEndpoint}
     SocketOps.ensure_winsock!()
     addresses = TCP.SocketEndpoint[]
+    hostname_s = String(hostname)
+    null_service = Ptr{UInt8}(C_NULL)
     hints = Ref{_AddrInfo}()
     hints_ptr = Base.unsafe_convert(Ptr{_AddrInfo}, hints)
     Base.Libc.memset(hints_ptr, 0, sizeof(_AddrInfo))
@@ -394,24 +397,27 @@ function _native_getaddrinfo(hostname::AbstractString; flags::Cint = Cint(0))::V
         unsafe_store!(Ptr{Cint}(hints_bytes + fieldoffset(_AddrInfo, 3)), _SOCK_STREAM)
     end
     result_ptr = Ref{Ptr{_AddrInfo}}(C_NULL)
-    ret = GC.@preserve hints begin
-        @static if Sys.iswindows()
-            @gcsafe_ccall "Ws2_32".getaddrinfo(
-                String(hostname)::Cstring,
-                C_NULL::Cstring,
-                hints_ptr::Ptr{_AddrInfo},
-                result_ptr::Ptr{Ptr{_AddrInfo}},
-            )::Cint
-        else
-            @gcsafe_ccall getaddrinfo(
-                String(hostname)::Cstring,
-                C_NULL::Cstring,
-                hints_ptr::Ptr{_AddrInfo},
-                result_ptr::Ptr{Ptr{_AddrInfo}},
-            )::Cint
-        end
+    # `getaddrinfo` can block inside the system resolver stack. Run it on Julia's
+    # libuv worker pool so hostname resolution does not occupy a Julia scheduler
+    # thread while callers wait on timeout/deadline machinery.
+    ret = @static if Sys.iswindows()
+        @threadcall((:getaddrinfo, "Ws2_32"), Cint,
+            (Cstring, Cstring, Ptr{_AddrInfo}, Ptr{Ptr{_AddrInfo}}),
+            hostname_s,
+            null_service,
+            hints,
+            result_ptr,
+        )
+    else
+        @threadcall(:getaddrinfo, Cint,
+            (Cstring, Cstring, Ptr{_AddrInfo}, Ptr{Ptr{_AddrInfo}}),
+            hostname_s,
+            null_service,
+            hints,
+            result_ptr,
+        )
     end
-    ret == 0 || _addr_error("lookup failed: $(_gai_error_string(ret))", String(hostname))
+    ret == 0 || _addr_error("lookup failed: $(_gai_error_string(ret))", hostname_s)
     try
         current = result_ptr[]
         while current != C_NULL
@@ -1309,6 +1315,37 @@ function _connect_deadline_ns(d::HostResolver)::Int64
     return _min_nonzero(timeout_deadline, d.deadline_ns)
 end
 
+function _wait_for_timer!(timer::EventLoops.TimerState)::Bool
+    while true
+        reason = EventLoops.pollwait!(timer.waiter)
+        reason == EventLoops.PollWakeReason.READY && return true
+        (@atomic :acquire timer.closed) && return false
+        (@atomic :acquire timer.deadline_ns) == 0 && return true
+    end
+end
+
+function _spawn_timer_task(f::F, deadline_ns::Int64) where {F}
+    timer = EventLoops.TimerState(deadline_ns, Int64(0))
+    EventLoops.schedule_timer!(timer, deadline_ns) || return nothing, nothing
+    task = errormonitor(Threads.@spawn begin
+        _wait_for_timer!(timer) || return nothing
+        f()
+        return nothing
+    end)
+    return timer, task
+end
+
+function _close_timer_task!(
+        timer::Union{Nothing, EventLoops.TimerState},
+        task::Union{Nothing, Task},
+    )
+    timer === nothing && return nothing
+    EventLoops._close_timer!(timer)
+    task === nothing && return nothing
+    wait(task)
+    return nothing
+end
+
 function _resolve_with_deadline(
         d::HostResolver,
         network::AbstractString,
@@ -1318,16 +1355,12 @@ function _resolve_with_deadline(
     deadline_ns == 0 && return resolve_tcp_addrs(d.resolver, network, address; op = :connect, policy = d.policy)
     now_ns = Int64(time_ns())
     now_ns >= deadline_ns && throw(DNSTimeoutError(String(address)))
-    timeout_s = (deadline_ns - now_ns) / 1.0e9
     mtx = ReentrantLock()
     condition = Threads.Condition(mtx)
     done = Ref(false)
     timed_out = Ref(false)
     result_ref = Ref{Union{Nothing, Vector{TCP.SocketEndpoint}, Exception}}(nothing)
-    # Resolution still relies on Julia tasks + Timer rather than the lower-level
-    # poller timer heap. That is acceptable here because DNS resolution is not
-    # currently driven by the socket event loop itself.
-    timer = Timer(timeout_s) do _
+    timer, timer_task = _spawn_timer_task(deadline_ns) do
         lock(mtx)
         try
             done[] && return nothing
@@ -1363,7 +1396,7 @@ function _resolve_with_deadline(
         end
     finally
         unlock(mtx)
-        close(timer)
+        _close_timer_task!(timer, timer_task)
     end
     timed_out[] && throw(DNSTimeoutError(String(address)))
     result = result_ref[]
@@ -1547,7 +1580,7 @@ function _resolve_parallel(
     # This is the Happy Eyeballs-style stagger: start one address family first,
     # then launch the fallback family if the primary path has not succeeded
     # quickly enough.
-    fallback_timer = Timer(delay_ns / 1.0e9) do _
+    fallback_timer, fallback_timer_task = _spawn_timer_task(Int64(time_ns()) + delay_ns) do
         _emit_event!(:fallback_timer)
     end
     primary_done = false
@@ -1577,10 +1610,7 @@ function _resolve_parallel(
                 end
                 if !fallback_started && !(@atomic :acquire state.done)
                     fallback_started = true
-                    try
-                        close(fallback_timer)
-                    catch
-                    end
+                    _close_timer_task!(fallback_timer, fallback_timer_task)
                     _start_racer(false, fallbacks)
                 end
             else
@@ -1597,10 +1627,7 @@ function _resolve_parallel(
             end
         end
     finally
-        try
-            close(fallback_timer)
-        catch
-        end
+        _close_timer_task!(fallback_timer, fallback_timer_task)
         try
             close(events)
         catch
