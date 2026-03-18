@@ -31,6 +31,10 @@ end
     return ex isa TL.TLSError || ex isa TL.TLSHandshakeTimeoutError
 end
 
+@inline function _tls_skip_windows_t2_write_timeout_sticky_test()::Bool
+    return Sys.iswindows() && Threads.nthreads() > 1 && get(ENV, "GITHUB_ACTIONS", "false") == "true"
+end
+
 function _tls_server_config(; handshake_timeout_ns::Int64 = 0)
     return TL.Config(
         verify_peer = false,
@@ -74,12 +78,8 @@ function _tls_connect(
     )
 end
 
-if !(Sys.isapple() || Sys.islinux())
-    @testset "TLS (macOS/Linux only)" begin
-        @test true
-    end
-else
-    @testset "TLS phase 6" begin
+@testset "TLS phase 6" begin
+        @test TL.Conn <: IO
         @testset "config validation" begin
             cfg_default = TL.Config()
             @test cfg_default.min_version == TL.TLS1_2_VERSION
@@ -545,11 +545,11 @@ else
                         conn = TL.accept(listener)
                         TL.handshake!(conn)
                         buf = Vector{UInt8}(undef, 4)
-                        n = read!(conn, buf)
-                        n > 0 && write(conn, view(buf, 1:n))
+                        read!(conn, buf)
+                        write(conn, buf)
                         view_buf = Vector{UInt8}(undef, 3)
-                        n = read!(conn, view_buf)
-                        n > 0 && write(conn, view(view_buf, 1:n))
+                        read!(conn, view_buf)
+                        write(conn, view_buf)
                         return conn
                     catch err
                         return err
@@ -564,12 +564,12 @@ else
                 payload = UInt8[0x61, 0x62, 0x63, 0x64]
                 @test write(client, payload) == 4
                 recv_buf = Vector{UInt8}(undef, 4)
-                @test read!(client, recv_buf) == 4
+                @test read!(client, recv_buf) === recv_buf
                 @test recv_buf == payload
                 payload_view = @view payload[2:4]
                 @test write(client, payload_view) == length(payload_view)
                 recv_view_buf = Vector{UInt8}(undef, length(payload_view))
-                @test read!(client, recv_view_buf) == length(payload_view)
+                @test read!(client, recv_view_buf) === recv_view_buf
                 @test recv_view_buf == collect(payload_view)
                 @test _tls_wait_task_done(accept_task, 12.0) != :timed_out
                 server_result = fetch(accept_task)
@@ -607,7 +607,8 @@ else
                 ))
                 @test _tls_wait_task_done(close_task, 2.0) != :timed_out
                 buf = Vector{UInt8}(undef, 1)
-                @test read!(client, buf) == 0
+                @test eof(client)
+                @test_throws EOFError read!(client, buf)
             finally
                 _tls_close_quiet!(client)
                 _tls_close_quiet!(listener)
@@ -645,7 +646,8 @@ else
                     @test write_err.message == "tls: protocol is shutdown"
                 end
                 TL.set_read_deadline!(server, time_ns() + 1_000_000_000)
-                @test read!(server, Vector{UInt8}(undef, 1)) == 0
+                @test eof(server)
+                @test_throws EOFError read!(server, Vector{UInt8}(undef, 1))
             finally
                 _tls_close_quiet!(server)
                 _tls_close_quiet!(client)
@@ -976,51 +978,55 @@ else
             end
         end
         @testset "write timeout remains sticky across subsequent writes" begin
-            IP.shutdown!()
-            listener = nothing
-            client = nothing
-            try
-                listener = TL.listen("tcp", "127.0.0.1:0", _tls_server_config(); backlog = 8)
-                laddr = TL.addr(listener)::NC.SocketAddrV4
-                hold_task = errormonitor(Threads.@spawn begin
-                    conn = TL.accept(listener)
-                    TL.handshake!(conn)
-                    IP.sleep(1.5)
-                    close(conn)
-                    return nothing
-                end)
-                client = _tls_connect("tcp", "127.0.0.1:$(Int(laddr.port))", TL.Config(
-                    verify_peer = false,
-                    server_name = "localhost",
-                ))
-                TL.set_write_deadline!(client, time_ns() + 5_000_000)
-                payload = fill(UInt8(0x5a), 64 * 1024 * 1024)
-                first_err = try
-                    write(client, payload)
-                    nothing
-                catch ex
-                    ex
-                end
-                @test first_err isa TL.TLSError
-                if first_err isa TL.TLSError
-                    @test first_err.message == "i/o timeout"
-                end
-                TL.set_write_deadline!(client, Int64(0))
-                second_err = try
-                    write(client, UInt8[0x01])
-                    nothing
-                catch ex
-                    ex
-                end
-                @test second_err isa TL.TLSError
-                if first_err isa TL.TLSError && second_err isa TL.TLSError
-                    @test second_err === first_err
-                end
-                @test _tls_wait_task_done(hold_task, 2.0) != :timed_out
-            finally
-                _tls_close_quiet!(client)
-                _tls_close_quiet!(listener)
+            if _tls_skip_windows_t2_write_timeout_sticky_test()
+                @test_skip true
+            else
                 IP.shutdown!()
+                listener = nothing
+                client = nothing
+                try
+                    listener = TL.listen("tcp", "127.0.0.1:0", _tls_server_config(); backlog = 8)
+                    laddr = TL.addr(listener)::NC.SocketAddrV4
+                    hold_task = errormonitor(Threads.@spawn begin
+                        conn = TL.accept(listener)
+                        TL.handshake!(conn)
+                        IP.sleep(1.5)
+                        close(conn)
+                        return nothing
+                    end)
+                    client = _tls_connect("tcp", "127.0.0.1:$(Int(laddr.port))", TL.Config(
+                        verify_peer = false,
+                        server_name = "localhost",
+                    ))
+                    TL.set_write_deadline!(client, time_ns() + 5_000_000)
+                    payload = fill(UInt8(0x5a), 64 * 1024 * 1024)
+                    first_err = try
+                        write(client, payload)
+                        nothing
+                    catch ex
+                        ex
+                    end
+                    @test first_err isa TL.TLSError
+                    if first_err isa TL.TLSError
+                        @test first_err.message == "i/o timeout"
+                    end
+                    TL.set_write_deadline!(client, Int64(0))
+                    second_err = try
+                        write(client, UInt8[0x01])
+                        nothing
+                    catch ex
+                        ex
+                    end
+                    @test second_err isa TL.TLSError
+                    if first_err isa TL.TLSError && second_err isa TL.TLSError
+                        @test second_err === first_err
+                    end
+                    @test _tls_wait_task_done(hold_task, 2.0) != :timed_out
+                finally
+                    _tls_close_quiet!(client)
+                    _tls_close_quiet!(listener)
+                    IP.shutdown!()
+                end
             end
         end
         @testset "blocked read unblocks when local close races" begin
@@ -1067,4 +1073,3 @@ else
             end
         end
     end
-end

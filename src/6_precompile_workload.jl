@@ -37,20 +37,14 @@ function _pc_write_byte(fd::Cint, b::UInt8)
 end
 
 function _pc_read_exact!(conn::NC.Conn, buf::Vector{UInt8})::Int
-    offset = 0
-    while offset < length(buf)
-        chunk = Vector{UInt8}(undef, length(buf) - offset)
-        n = read!(conn, chunk)
-        n > 0 || throw(EOFError())
-        copyto!(buf, offset + 1, chunk, 1, n)
-        offset += n
-    end
-    return offset
+    read!(conn, buf)
+    return length(buf)
 end
 
 function _pc_wait_connect_ready!(fd::Cint)
     registration = IP.register!(fd; mode = IP.PollMode.WRITE)
     try
+        IP.arm_waiter!(registration, IP.PollMode.WRITE)
         IP.pollwait!(registration.write_waiter)
     finally
         IP.deregister!(fd)
@@ -295,8 +289,7 @@ function _pc_run_tls_workload!()
         recv_buf = Vector{UInt8}(undef, 3)
         written = write(client, payload)
         written == 3 || throw(ArgumentError("TLS precompile workload expected 3-byte write"))
-        read_count = read!(server, recv_buf)
-        read_count == 3 || throw(ArgumentError("TLS precompile workload expected 3-byte read"))
+        read!(server, recv_buf)
     finally
         try
             server === nothing || close(server)
