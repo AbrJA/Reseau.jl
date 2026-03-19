@@ -73,6 +73,10 @@ end
                 string_buf = Vector{UInt8}(undef, 2)
                 @test read!(server, string_buf) === string_buf
                 @test String(string_buf) == "ok"
+                @test write(client, codeunits("hi")) == 2
+                codeunits_buf = Vector{UInt8}(undef, 2)
+                @test read!(server, codeunits_buf) === codeunits_buf
+                @test String(codeunits_buf) == "hi"
                 @test write(client, UInt8[0x31, 0x32, 0x33]) == 3
                 short_buf = UInt8[]
                 @test readbytes!(server, short_buf, 3) == 3

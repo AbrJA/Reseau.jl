@@ -585,6 +585,9 @@ end
                         view_buf = Vector{UInt8}(undef, 3)
                         read!(conn, view_buf)
                         write(conn, view_buf)
+                        server_codeunits_buf = Vector{UInt8}(undef, 2)
+                        read!(conn, server_codeunits_buf)
+                        write(conn, server_codeunits_buf)
                         return conn
                     catch err
                         return err
@@ -606,6 +609,10 @@ end
                 recv_view_buf = Vector{UInt8}(undef, length(payload_view))
                 @test read!(client, recv_view_buf) === recv_view_buf
                 @test recv_view_buf == collect(payload_view)
+                @test write(client, codeunits("hi")) == 2
+                client_codeunits_buf = Vector{UInt8}(undef, 2)
+                @test read!(client, client_codeunits_buf) === client_codeunits_buf
+                @test String(client_codeunits_buf) == "hi"
                 @test _tls_wait_task_done(accept_task, 12.0) != :timed_out
                 server_result = fetch(accept_task)
                 server_result isa Exception && throw(server_result)

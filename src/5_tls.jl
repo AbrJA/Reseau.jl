@@ -1416,6 +1416,12 @@ function Base.write(conn::Conn, buf::StridedVector{UInt8})::Int
     end
 end
 
+function Base.write(conn::Conn, buf::Base.CodeUnits{UInt8,<:AbstractString})::Int
+    GC.@preserve buf begin
+        return Int(Base.unsafe_write(conn, pointer(buf), UInt(length(buf))))
+    end
+end
+
 function Base.write(conn::Conn, buf::AbstractVector{UInt8})::Int
     data = Vector{UInt8}(buf)
     GC.@preserve data begin
