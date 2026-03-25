@@ -436,8 +436,13 @@ end
             end
         end
         @testset "IPv6 show output uses compressed form" begin
+            @test string(NC.loopback_addr(80)) == "127.0.0.1:80"
+            @test repr(NC.loopback_addr(80)) == "127.0.0.1:80"
+            @test string(NC.any_addr(0)) == "0.0.0.0:0"
             @test repr(NC.loopback_addr6(443)) == "[::1]:443"
+            @test string(NC.loopback_addr6(443)) == "[::1]:443"
             @test repr(NC.any_addr6(0)) == "[::]:0"
+            @test string(NC.any_addr6(0)) == "[::]:0"
             doc_addr = NC.SocketAddrV6((
                     0x20, 0x01, 0x0d, 0xb8,
                     0x00, 0x00, 0x00, 0x00,
@@ -447,7 +452,9 @@ end
                 8443,
             )
             @test repr(doc_addr) == "[2001:db8::1]:8443"
+            @test string(doc_addr) == "[2001:db8::1]:8443"
             scoped = NC.SocketAddrV6(NC.loopback_addr6(1).ip, 1; scope_id = 7)
             @test repr(scoped) == "[::1%7]:1"
+            @test string(scoped) == "[::1%7]:1"
         end
     end

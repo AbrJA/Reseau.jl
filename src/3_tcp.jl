@@ -200,17 +200,24 @@ function _format_ipv6(ip::NTuple{16, UInt8})::String
 end
 
 function Base.show(io::IO, addr::SocketAddrV4)
-    print(io, "$(addr.ip[1]).$(addr.ip[2]).$(addr.ip[3]).$(addr.ip[4]):$(addr.port)")
+    print(io, string(addr))
     return nothing
 end
 
 function Base.show(io::IO, addr::SocketAddrV6)
-    if addr.scope_id != 0
-        print(io, "[$(_format_ipv6(addr.ip))%$(addr.scope_id)]:$(addr.port)")
-    else
-        print(io, "[$(_format_ipv6(addr.ip))]:$(addr.port)")
-    end
+    print(io, string(addr))
     return nothing
+end
+
+function Base.string(addr::SocketAddrV4)
+    return "$(addr.ip[1]).$(addr.ip[2]).$(addr.ip[3]).$(addr.ip[4]):$(addr.port)"
+end
+
+function Base.string(addr::SocketAddrV6)
+    if addr.scope_id != 0
+        return "[$(_format_ipv6(addr.ip))%$(addr.scope_id)]:$(addr.port)"
+    end
+    return "[$(_format_ipv6(addr.ip))]:$(addr.port)"
 end
 
 """
