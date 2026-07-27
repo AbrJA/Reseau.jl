@@ -140,7 +140,11 @@ function _tls13_server_share_and_secret(client_share::TLHC._TLSKeyShare)
         return TLHC._tls13_openssl_x25519_server_share_and_secret(client_share.data, _TLS13_TEST_SERVER_X25519_PRIVATE_KEY)
     end
     if client_share.group == TLHC._TLS_GROUP_SECP256R1
-        return TLHC._tls13_openssl_p256_server_share_and_secret(client_share.data, _TLS13_TEST_SERVER_P256_PRIVATE_KEY)
+        return TLHC._tls_openssl_ec_server_share_and_secret(
+            TLHC.P256,
+            client_share.data,
+            _TLS13_TEST_SERVER_P256_PRIVATE_KEY,
+        )
     end
     error("unsupported test key-share group $(string(client_share.group, base = 16))")
 end
@@ -451,14 +455,49 @@ end
                 @test err isa TLHC.TLSError || err isa ArgumentError
             end
 
-            client_p256_pkey = TLHC._tls13_p256_private_key_from_bytes(_TLS13_TEST_CLIENT_P256_PRIVATE_KEY)
-            client_p256_share = TLHC._tls13_p256_public_key(client_p256_pkey)
-            p256_result = TLHC._tls13_openssl_p256_server_share_and_secret(client_p256_share, _TLS13_TEST_SERVER_P256_PRIVATE_KEY)
+            client_p256_pkey = TLHC._tls_ec_private_key_from_bytes(TLHC.P256, _TLS13_TEST_CLIENT_P256_PRIVATE_KEY)
+            client_p256_share = TLHC._tls_ec_public_key(TLHC.P256, client_p256_pkey)
+            p256_result = TLHC._tls_openssl_ec_server_share_and_secret(
+                TLHC.P256,
+                client_p256_share,
+                _TLS13_TEST_SERVER_P256_PRIVATE_KEY,
+            )
             server_p256_secret = p256_result.secret
-            client_p256_secret = TLHC._tls13_p256_shared_secret(client_p256_pkey, p256_result.share_data)
+            client_p256_secret = TLHC._tls_ec_shared_secret(TLHC.P256, client_p256_pkey, p256_result.share_data)
             @test p256_result.group == TLHC._TLS_GROUP_SECP256R1
             @test client_p256_secret == p256_result.secret
-            @test_throws ArgumentError TLHC._tls13_p256_peer_public_key(vcat(UInt8[0x02], zeros(UInt8, 32)))
+            @test_throws ArgumentError TLHC._tls_ec_peer_public_key(
+                TLHC.P256,
+                vcat(UInt8[0x02], zeros(UInt8, 32)),
+            )
+
+            for (group, public_key_length, coordinate_length) in (
+                (TLHC.P384, 97, 48),
+                (TLHC.P521, 133, 66),
+            )
+                client_pkey_nist = TLHC._tls_ec_generate_private_key(group)
+                server_pkey_nist = TLHC._tls_ec_generate_private_key(group)
+                client_secret_nist = UInt8[]
+                server_secret_nist = UInt8[]
+                try
+                    client_share_nist = TLHC._tls_ec_public_key(group, client_pkey_nist)
+                    server_share_nist = TLHC._tls_ec_public_key(group, server_pkey_nist)
+                    client_secret_nist = TLHC._tls_ec_shared_secret(group, client_pkey_nist, server_share_nist)
+                    server_secret_nist = TLHC._tls_ec_shared_secret(group, server_pkey_nist, client_share_nist)
+                    @test length(client_share_nist) == public_key_length
+                    @test length(server_share_nist) == public_key_length
+                    @test client_secret_nist == server_secret_nist
+                    @test_throws ArgumentError TLHC._tls_ec_peer_public_key(
+                        group,
+                        vcat(UInt8[0x02], zeros(UInt8, coordinate_length)),
+                    )
+                finally
+                    TLHC._free_evp_pkey!(client_pkey_nist)
+                    TLHC._free_evp_pkey!(server_pkey_nist)
+                    TLHC._securezero!(client_secret_nist)
+                    TLHC._securezero!(server_secret_nist)
+                end
+            end
 
             p256_cert_pkey = _tls13_generate_test_ec_pkey("prime256v1")
             p384_cert_pkey = _tls13_generate_test_ec_pkey("secp384r1")
@@ -783,7 +822,7 @@ end
                  sh.server_share = TLHC._TLSKeyShare(TLHC._TLS_GROUP_X25519, zeros(UInt8, 32))
             end),
             ("unsupported selected group", TLHC._TLS_ALERT_ILLEGAL_PARAMETER,
-             sh -> (sh.selected_group = UInt16(0x0018))),
+             sh -> (sh.selected_group = TLHC._TLS_GROUP_SECP384R1)),
             ("redundant selected group", TLHC._TLS_ALERT_ILLEGAL_PARAMETER,
              sh -> (sh.selected_group = TLHC._TLS_GROUP_X25519)),
             ("unsolicited ECH", TLHC._TLS_ALERT_UNSUPPORTED_EXTENSION,

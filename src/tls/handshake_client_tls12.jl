@@ -409,10 +409,14 @@ function _tls12_generate_client_key_exchange(
 )::_TLS12ClientKeyExchangeResult
     in(group, advertised_curves) ||
         _tls_fail(_TLS_ALERT_ILLEGAL_PARAMETER, "tls: server selected an unadvertised TLS 1.2 ECDHE curve")
-    if group != _TLS_GROUP_X25519 && group != _TLS_GROUP_SECP256R1
+    if group != _TLS_GROUP_X25519 && !_tls_nist_curve_supported(group)
         _tls_fail(_TLS_ALERT_HANDSHAKE_FAILURE, "tls: native TLS 1.2 client does not support ECDHE group $(string(group, base = 16))")
     end
-    private_key = group == _TLS_GROUP_X25519 ? _tls13_x25519_generate_private_key() : _tls13_p256_generate_private_key()
+    private_key = if group == _TLS_GROUP_X25519
+        _tls13_x25519_generate_private_key()
+    else
+        _tls_ec_generate_private_key(group)
+    end
     client_public_key = UInt8[]
     shared_secret = UInt8[]
     try
@@ -420,8 +424,8 @@ function _tls12_generate_client_key_exchange(
             client_public_key = _tls13_x25519_public_key(private_key)
             shared_secret = _tls13_x25519_shared_secret(private_key, server_public_key)
         else
-            client_public_key = _tls13_p256_public_key(private_key)
-            shared_secret = _tls13_p256_shared_secret(private_key, server_public_key)
+            client_public_key = _tls_ec_public_key(group, private_key)
+            shared_secret = _tls_ec_shared_secret(group, private_key, server_public_key)
         end
         body = UInt8[UInt8(length(client_public_key))]
         append!(body, client_public_key)
