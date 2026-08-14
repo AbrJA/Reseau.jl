@@ -241,6 +241,31 @@ end
     return err.errnum == Int(Base.Libc.ENOTCONN) || err.errnum == Int(Base.Libc.EINVAL)
 end
 
+function _finalizer_close!(pfd::IOPoll.FD)
+    try
+        Base.close(pfd)
+    catch
+    end
+    return nothing
+end
+
+# GC safety net mirroring Go's `runtime.SetFinalizer((*netFD).Close)` and the
+# libuv finalizer behind `Sockets.TCPSocket`: a leaked `Conn`/`Listener` must
+# not leak its descriptor. Finalizers cannot task-switch, and a full close
+# takes poller locks and drains in-flight operations, so the real close runs on
+# a spawned task. Attach the finalizer to the poll FD, not its net metadata
+# wrapper: every active operation retains the poll FD through its final
+# unlock/decref, so the safety net cannot close a descriptor that is still in
+# use after the wrapper's last field access. Explicit `close` remains the
+# documented path — this only reclaims descriptors the program forgot.
+function _netfd_finalizer(pfd::IOPoll.FD)
+    IOPoll._fdlock_closing(pfd.fdlock) && return nothing
+    t = Task(() -> _finalizer_close!(pfd))
+    t.sticky = false
+    schedule(t)
+    return nothing
+end
+
 function _new_netfd(
         sysfd::SocketOps.SocketFD;
         family::Cint = SocketOps.AF_INET,
@@ -252,6 +277,7 @@ function _new_netfd(
     # datagram sockets do neither (an empty datagram is valid data).
     is_stream = sotype == SocketOps.SOCK_STREAM
     pfd = IOPoll.FD(sysfd; is_stream = is_stream, zero_read_is_eof = is_stream, is_file = false)
+    finalizer(_netfd_finalizer, pfd)
     return FD(pfd, family, sotype, net, is_connected, nothing, nothing)
 end
 

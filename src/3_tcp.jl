@@ -493,6 +493,12 @@ Create a TCP listener from a bound local address.
 
 This is the direct-address equivalent of the `listen(network, address; ...)`
 overloads on the same `TCP.listen` generic.
+
+`reuseaddr` sets `SO_REUSEADDR` so a restarting server can rebind a port whose
+previous listener is still in TIME_WAIT. On Windows it is a deliberate no-op:
+Windows allows the TIME_WAIT rebind without the option, and `SO_REUSEADDR`
+there instead permits binding over an *active* listener (silently starving it
+of connections). Go and libuv make the same choice.
 """
 function _listen_socketaddr_impl(
         local_addr::SocketAddr,
@@ -504,7 +510,16 @@ function _listen_socketaddr_impl(
     fd = open_tcp_fd!(; family = family, net = network)
     try
         family == SocketOps.AF_INET6 && _set_ipv6_only!(fd, network === :tcp6)
-        reuseaddr && SocketOps.set_sockopt_int(fd.pfd.sysfd, SocketOps.SOL_SOCKET, SocketOps.SO_REUSEADDR, 1)
+        @static if !Sys.iswindows()
+            # POSIX SO_REUSEADDR permits rebinding a port stuck in TIME_WAIT.
+            # Windows gives the same TIME_WAIT rebinding without the option,
+            # and setting it there instead means "bind over an active
+            # listener" — a hijack that silently starves the original of
+            # connections. Go and libuv likewise never set SO_REUSEADDR on
+            # Windows TCP listeners, so `reuseaddr` is a deliberate no-op
+            # there.
+            reuseaddr && SocketOps.set_sockopt_int(fd.pfd.sysfd, SocketOps.SOL_SOCKET, SocketOps.SO_REUSEADDR, 1)
+        end
         SocketOps.bind_socket(fd.pfd.sysfd, _to_sockaddr(local_addr))
         SocketOps.listen_socket(fd.pfd.sysfd, backlog)
         IOPoll.register!(fd.pfd)
@@ -523,6 +538,53 @@ function listen(local_addr::SocketAddr; backlog::Integer = 128, reuseaddr::Bool 
         backlog = backlog,
         reuseaddr = reuseaddr,
     )
+end
+
+@inline _with_port(addr::SocketAddrV4, port::Integer)::SocketAddrV4 = SocketAddrV4(addr.ip, port)
+@inline function _with_port(addr::SocketAddrV6, port::Integer)::SocketAddrV6
+    return SocketAddrV6(addr.ip, port; scope_id = Int(addr.scope_id))
+end
+
+@inline function _is_port_taken_errno(errnum::Integer)::Bool
+    return errnum == Int(Base.Libc.EADDRINUSE) || errnum == Int(Base.Libc.EACCES)
+end
+
+"""
+    listenany(hint::Integer; backlog=128, reuseaddr=true) -> (UInt16, Listener)
+    listenany(hint::SocketAddr; backlog=128, reuseaddr=true) -> (UInt16, Listener)
+
+Bind a listener on the first available port at or above `hint`'s port,
+returning the bound port and the listener (the `Sockets.listenany` idiom).
+The integer form binds to the IPv4 loopback address.
+
+Ports that are in use (`EADDRINUSE`) or forbidden (`EACCES`) are skipped by
+incrementing the port; running out of ports rethrows the last error. A hint
+port of `0` binds an ephemeral port directly.
+
+`reuseaddr` follows [`listen`](@ref) semantics, including its Windows no-op:
+exclusive Windows binds are exactly what keeps `EADDRINUSE` (and therefore
+this availability probe) reliable there.
+"""
+function listenany(hint::Integer; backlog::Integer = 128, reuseaddr::Bool = true)::Tuple{UInt16, Listener}
+    return listenany(loopback_addr(hint); backlog = backlog, reuseaddr = reuseaddr)
+end
+
+function listenany(hint::SocketAddr; backlog::Integer = 128, reuseaddr::Bool = true)::Tuple{UInt16, Listener}
+    addr = hint
+    while true
+        listener = try
+            listen(addr; backlog = backlog, reuseaddr = reuseaddr)
+        catch err
+            ex = err::Exception
+            (ex isa SystemError && _is_port_taken_errno(ex.errnum)) || rethrow(ex)
+            next_port = Int(addr.port) + 1
+            next_port > 0xffff && rethrow(ex)
+            addr = _with_port(addr, next_port)
+            continue
+        end
+        bound = local_addr(listener)
+        return ((bound::SocketEndpoint).port, listener)
+    end
 end
 
 """
@@ -1054,18 +1116,161 @@ function set_nodelay!(conn::Conn, enabled::Bool = true)
 end
 
 """
-    set_keepalive!(conn, enabled=true)
+    set_keepalive!(conn, enabled=true; idle_secs=nothing, interval_secs=nothing, count=nothing)
 
-Enable or disable `SO_KEEPALIVE` on `conn`.
+Enable or disable `SO_KEEPALIVE` on `conn`, optionally tuning the probe
+schedule (the shape of Go's `KeepAliveConfig`):
+
+- `idle_secs`: idle time before the first probe (`TCP_KEEPIDLE`;
+  `TCP_KEEPALIVE` on Darwin)
+- `interval_secs`: time between unanswered probes (`TCP_KEEPINTVL`)
+- `count`: unanswered probes before the connection is dropped (`TCP_KEEPCNT`)
+
+Tuning values are applied only when provided. Platforms without a given knob
+surface the kernel's `SystemError` (notably OpenBSD, and Windows releases
+before Server 2016 / Windows 10 1709).
 """
-function set_keepalive!(conn::Conn, enabled::Bool = true)
+function set_keepalive!(
+        conn::Conn,
+        enabled::Bool = true;
+        idle_secs::Union{Nothing, Integer} = nothing,
+        interval_secs::Union{Nothing, Integer} = nothing,
+        count::Union{Nothing, Integer} = nothing,
+    )
+    idle = _positive_sockopt_value("idle_secs", idle_secs)
+    interval = _positive_sockopt_value("interval_secs", interval_secs)
+    probes = _positive_sockopt_value("count", count)
     IOPoll.set_sockopt_int!(
         conn.fd.pfd,
         SocketOps.SOL_SOCKET,
         SocketOps.SO_KEEPALIVE,
         enabled ? 1 : 0,
     )
+    if idle !== nothing
+        IOPoll.set_sockopt_int!(conn.fd.pfd, SocketOps.IPPROTO_TCP, SocketOps.TCP_KEEPIDLE, idle)
+    end
+    if interval !== nothing
+        IOPoll.set_sockopt_int!(conn.fd.pfd, SocketOps.IPPROTO_TCP, SocketOps.TCP_KEEPINTVL, interval)
+    end
+    if probes !== nothing
+        IOPoll.set_sockopt_int!(conn.fd.pfd, SocketOps.IPPROTO_TCP, SocketOps.TCP_KEEPCNT, probes)
+    end
     return nothing
+end
+
+@inline _positive_sockopt_value(::AbstractString, ::Nothing)::Nothing = nothing
+
+function _positive_sockopt_value(name::AbstractString, value::Integer)::Cint
+    0 < value <= typemax(Cint) ||
+        throw(ArgumentError("$name must be in [1, $(typemax(Cint))]"))
+    return Cint(value)
+end
+
+"""
+    set_quickack!(conn, enabled=true)
+
+Toggle `TCP_QUICKACK` (Linux). On other platforms this is a silent no-op,
+matching `Sockets.quickack`, so cross-platform callers can set it
+unconditionally. The kernel may clear the flag again after some transfers;
+latency-sensitive callers re-assert it as needed.
+"""
+function set_quickack!(conn::Conn, enabled::Bool = true)
+    @static if Sys.islinux()
+        IOPoll.set_sockopt_int!(
+            conn.fd.pfd,
+            SocketOps.IPPROTO_TCP,
+            SocketOps.TCP_QUICKACK,
+            enabled ? 1 : 0,
+        )
+    else
+        # Match Sockets' no-op while preserving its open-socket check.
+        IOPoll._with_fd_ref(conn.fd.pfd) do _
+            nothing
+        end
+    end
+    return nothing
+end
+
+"""
+    set_linger!(conn, timeout_secs)
+
+Configure `SO_LINGER`, following Go's `SetLinger`: a negative timeout disables
+lingering (`close` returns immediately and the OS flushes in the background —
+the default), `0` discards unsent data on close with a RST, and a positive
+timeout asks the OS to keep sending in the background. On some systems,
+including Linux, a positive timeout may block `close` until data is sent or
+discarded. Remaining data may be discarded after the timeout on some systems.
+Nonnegative timeouts must not exceed 65535 seconds.
+"""
+function set_linger!(conn::Conn, timeout_secs::Integer)
+    lg = if timeout_secs < 0
+        SocketOps.Linger(0, 0)
+    else
+        timeout_secs > 0xffff && throw(ArgumentError("linger timeout must be at most 65535 seconds"))
+        SocketOps.Linger(1, timeout_secs)
+    end
+    IOPoll.set_sockopt_bytes!(conn.fd.pfd, SocketOps.SOL_SOCKET, SocketOps.SO_LINGER, Ref(lg))
+    return nothing
+end
+
+"""
+    set_read_buffer!(conn, nbytes)
+
+Set the kernel receive buffer size (`SO_RCVBUF`). The kernel may round the
+value, enforce minimums, or (on Linux) double it to leave bookkeeping room.
+"""
+function set_read_buffer!(conn::Conn, nbytes::Integer)
+    size = _positive_sockopt_value("buffer size", nbytes)
+    IOPoll.set_sockopt_int!(conn.fd.pfd, SocketOps.SOL_SOCKET, SocketOps.SO_RCVBUF, size)
+    return nothing
+end
+
+"""
+    set_write_buffer!(conn, nbytes)
+
+Set the kernel send buffer size (`SO_SNDBUF`). The kernel may round the
+value, enforce minimums, or (on Linux) double it to leave bookkeeping room.
+"""
+function set_write_buffer!(conn::Conn, nbytes::Integer)
+    size = _positive_sockopt_value("buffer size", nbytes)
+    IOPoll.set_sockopt_int!(conn.fd.pfd, SocketOps.SOL_SOCKET, SocketOps.SO_SNDBUF, size)
+    return nothing
+end
+
+"""
+    rawfd(conn) -> RawFD or Base.WindowsRawSocket
+
+Return the OS-level socket descriptor backing `conn` (a `RawFD` on POSIX, a
+`Base.WindowsRawSocket` on Windows) for FFI and interop.
+
+Reseau retains ownership: the descriptor is non-blocking and registered with
+the internal poller; callers must not close it, change its flags, or use it
+after `close(conn)`. The result is a borrowed snapshot. Keep `conn` reachable,
+for example with `GC.@preserve`, and prevent a concurrent `close(conn)` for the
+full external operation. Throws `NetClosingError` if the socket is already
+closing.
+"""
+function rawfd(conn::Conn)
+    return _rawfd(conn.fd)
+end
+
+"""
+    rawfd(listener) -> RawFD or Base.WindowsRawSocket
+
+Listener variant of [`rawfd`](@ref). The same ownership rules apply.
+"""
+function rawfd(listener::Listener)
+    return _rawfd(listener.fd)
+end
+
+function _rawfd(fd::FD)
+    return IOPoll._with_fd_ref(fd.pfd) do sysfd
+        @static if Sys.iswindows()
+            return Base.WindowsRawSocket(Ptr{Cvoid}(sysfd))
+        else
+            return RawFD(sysfd)
+        end
+    end
 end
 
 """
